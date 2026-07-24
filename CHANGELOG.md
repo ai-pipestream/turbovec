@@ -11,6 +11,22 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
+### turbovec-grpc — gRPC server
+
+#### Added
+
+- **New crate: a gRPC server for the index.** `turbovec-grpc` is a third
+  workspace member alongside the Python bindings, wrapping the core crate
+  behind a handle-based gRPC service so the index is reachable from any
+  language with a gRPC stack, not just Python. Create or load an index, then
+  add and search against a handle. `Add` is client-streaming (chunked ingest,
+  no train step); `Search` is unary with an optional allowlist pushed into the
+  kernel; `SearchStream` is server-streaming, one result per query as it is
+  scored. Searches run under a read lock and never block one another; `add`
+  and `remove` take a write lock on the single index they touch, and every
+  call runs on the blocking pool. An end-to-end smoke test drives a live
+  server through the full surface.
+
 ### turbovec — Rust crate
 
 #### Added
