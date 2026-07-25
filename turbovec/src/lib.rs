@@ -1185,6 +1185,84 @@ impl TurboQuantIndex {
         *self = fresh;
     }
 
+    /// Construct an index with a pre-fitted TQ+ calibration instead of
+    /// fitting one from the first add.
+    ///
+    /// Normally the per-coordinate `(shift, scale)` calibration is fitted
+    /// to the empirical quantiles of the first non-empty batch and locked
+    /// for the lifetime of the index, which makes the quantized codes —
+    /// and therefore scores — depend on build history: two indexes built
+    /// from different data (or the same data in different batches) encode
+    /// the same vector differently. Seeding the calibration removes that
+    /// dependence: every index constructed with the same calibration
+    /// encodes a given vector identically, so scores are directly
+    /// comparable across separately built indexes (time-partitioned
+    /// corpora, blue/green rebuilds, A/B experiments).
+    ///
+    /// Seeding also decouples calibration quality from whatever the first
+    /// add happens to contain: a small or skewed first batch would
+    /// otherwise lock an identity or unrepresentative calibration. Fit
+    /// once on a representative sample (build a throwaway index from the
+    /// sample and read [`Self::calibration`]), then seed real indexes
+    /// from it.
+    ///
+    /// The seeded calibration behaves exactly as if the first add had
+    /// fitted it: all adds encode with it and it persists through
+    /// [`Self::write`] / [`Self::load`].
+    ///
+    /// Returns the same errors as [`Self::new`] for `dim` / `bit_width`,
+    /// plus:
+    /// - [`ConstructError::CalibrationLengthMismatch`] unless
+    ///   `shift.len() == scale.len() == dim`.
+    /// - [`ConstructError::CalibrationShiftNotFinite`] if a shift entry
+    ///   is NaN or infinite.
+    /// - [`ConstructError::CalibrationScaleNotPositive`] if a scale entry
+    ///   is NaN, infinite, zero, or negative (encoding divides by scale).
+    pub fn new_with_calibration(
+        dim: usize,
+        bit_width: usize,
+        shift: &[f32],
+        scale: &[f32],
+    ) -> Result<Self, ConstructError> {
+        let mut index = Self::new(dim, bit_width)?;
+        if shift.len() != dim || scale.len() != dim {
+            return Err(ConstructError::CalibrationLengthMismatch {
+                dim,
+                shift_len: shift.len(),
+                scale_len: scale.len(),
+            });
+        }
+        if let Some(coord_index) = shift.iter().position(|s| !s.is_finite()) {
+            return Err(ConstructError::CalibrationShiftNotFinite { coord_index });
+        }
+        if let Some(coord_index) = scale.iter().position(|s| !(s.is_finite() && *s > 0.0)) {
+            return Err(ConstructError::CalibrationScaleNotPositive { coord_index });
+        }
+        index.tqplus_shift = shift.to_vec();
+        index.tqplus_scale = scale.to_vec();
+        // A seeded index is past warm-up by definition: its calibration
+        // was fitted on an external sample the caller trusts. Leaving the
+        // warm-up buffer active would let the batch that crosses
+        // TQPLUS_MIN_SAMPLES refit and silently replace the seed.
+        index.warmup = None;
+        Ok(index)
+    }
+
+    /// The locked TQ+ per-coordinate calibration as `(shift, scale)`
+    /// slices of length `dim`, or `None` when no calibration exists yet
+    /// (a fresh index before its first non-empty add, unless it was
+    /// constructed via [`Self::new_with_calibration`]).
+    ///
+    /// The returned slices are exactly what [`Self::new_with_calibration`]
+    /// accepts, so a calibration fitted by one index can seed another.
+    pub fn calibration(&self) -> Option<(&[f32], &[f32])> {
+        if self.tqplus_shift.is_empty() {
+            None
+        } else {
+            Some((self.tqplus_shift.as_slice(), self.tqplus_scale.as_slice()))
+        }
+    }
+
     /// Add a flat batch of vectors. `dim` must be set (either eagerly at
     /// construction or by a prior [`Self::add_2d`] call).
     ///
@@ -1932,6 +2010,8 @@ impl TurboQuantIndex {
         // silently wrong scores, and an `n_calib = 0` trailer on the
         // next write. That is what the old `n_vectors == 0` guard did
         // after an index was drained to empty and re-added to (#284).
+        // A calibration seeded at construction rides the same rule: it
+        // makes `encode` take the reuse path, whose empty pair lands here.
         if !shift.is_empty() {
             self.tqplus_shift = shift;
             self.tqplus_scale = scale_tq;

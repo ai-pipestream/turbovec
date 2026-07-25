@@ -731,6 +731,18 @@ appears under each surface it touches.
   dependencies are all gone. The crate now builds with a plain `cargo
   build` and no native toolchain, which removes most of what took the
   Linux x86_64 wheel from ~1.8 MB to ~42 MB. (#206)
+- **Seeded TQ+ calibration.** `TurboQuantIndex::new_with_calibration` /
+  `IdMapIndex::new_with_calibration` construct an index with a pre-fitted
+  per-coordinate `(shift, scale)` calibration instead of fitting one from
+  the first add, and the new `calibration()` getter exposes the locked
+  calibration so it can be fitted once on a representative sample and
+  reused. Indexes seeded with the same calibration encode a given vector
+  byte-identically regardless of build history, making scores directly
+  comparable across separately built indexes; seeding also protects a
+  small or skewed first batch from locking identity or unrepresentative
+  calibration. Invalid calibrations are rejected with the new
+  `ConstructError::CalibrationLengthMismatch` /
+  `CalibrationShiftNotFinite` / `CalibrationScaleNotPositive` variants.
 
 - **The unchecked low-level kernels are no longer public.**
   **Breaking (Rust crate).** `codebook::codebook`, `encode::encode`,
