@@ -178,6 +178,25 @@ pub enum ConstructError {
         /// The ceiling, [`MAX_DIM`](crate::MAX_DIM).
         max: usize,
     },
+
+    /// A calibration passed to
+    /// [`TurboQuantIndex::new_with_calibration`](crate::TurboQuantIndex::new_with_calibration)
+    /// has the wrong length: both `shift` and `scale` must have exactly
+    /// `dim` entries.
+    CalibrationLengthMismatch {
+        dim: usize,
+        shift_len: usize,
+        scale_len: usize,
+    },
+
+    /// A calibration `shift` entry is NaN or infinite. The value itself is
+    /// not carried so the enum stays `Eq` (see the `AddError` note above).
+    CalibrationShiftNotFinite { coord_index: usize },
+
+    /// A calibration `scale` entry is NaN, infinite, zero, or negative.
+    /// Encoding divides by `scale`, so only finite positive values are
+    /// representable.
+    CalibrationScaleNotPositive { coord_index: usize },
 }
 
 impl fmt::Display for ConstructError {
@@ -192,6 +211,22 @@ impl fmt::Display for ConstructError {
             Self::DimTooLarge { dim, max } => {
                 write!(f, "dim {dim} exceeds maximum {max}")
             }
+            Self::CalibrationLengthMismatch {
+                dim,
+                shift_len,
+                scale_len,
+            } => write!(
+                f,
+                "calibration length mismatch: dim={dim}, shift has {shift_len} \
+                 entries, scale has {scale_len} entries",
+            ),
+            Self::CalibrationShiftNotFinite { coord_index } => {
+                write!(f, "calibration shift at coord {coord_index} is not finite")
+            }
+            Self::CalibrationScaleNotPositive { coord_index } => write!(
+                f,
+                "calibration scale at coord {coord_index} must be finite and > 0",
+            ),
         }
     }
 }
