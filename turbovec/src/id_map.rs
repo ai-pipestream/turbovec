@@ -285,6 +285,30 @@ impl IdMapIndex {
         })
     }
 
+    /// Construct an id-map index with a pre-fitted TQ+ calibration. See
+    /// [`TurboQuantIndex::new_with_calibration`] for the motivation and
+    /// semantics; propagates the same errors.
+    pub fn new_with_calibration(
+        dim: usize,
+        bit_width: usize,
+        shift: &[f32],
+        scale: &[f32],
+    ) -> Result<Self, ConstructError> {
+        Ok(Self {
+            inner: TurboQuantIndex::new_with_calibration(dim, bit_width, shift, scale)?,
+            slot_to_id: Vec::new(),
+            id_to_slot: std::sync::OnceLock::from(HashMap::default()),
+            sorted_ids: std::sync::Mutex::new(Vec::new()),
+            deferred_added: std::sync::Mutex::new(Default::default()),
+        })
+    }
+
+    /// The locked TQ+ calibration as `(shift, scale)`, or `None` when no
+    /// calibration exists yet. See [`TurboQuantIndex::calibration`].
+    pub fn calibration(&self) -> Option<(&[f32], &[f32])> {
+        self.inner.calibration()
+    }
+
     /// Construct an empty id-map index without committing to a dim. The
     /// dim is inferred and locked on the first [`Self::add_with_ids_2d`]
     /// call. Propagates the same errors as [`TurboQuantIndex::new_lazy`].
