@@ -573,7 +573,8 @@ fn retain_scratch(scratch: &mut Vec<f32>, prev: usize, want: usize) -> usize {
 }
 
 /// Top-`k` results for a batch of queries, as returned by
-/// [`TurboQuantIndex::search`] / [`TurboQuantIndex::search_with_mask`].
+/// [`TurboQuantIndex::search`] / [`TurboQuantIndex::search_with_mask`] /
+/// [`TurboQuantIndex::search_with_options`].
 ///
 /// `scores` and `indices` are flattened row-major with one row per
 /// query: row `qi` occupies indices `qi * k .. (qi + 1) * k` in both,
@@ -590,6 +591,12 @@ fn retain_scratch(scratch: &mut Vec<f32>, prev: usize, want: usize) -> usize {
 /// patterns. Good enough for `assert_eq!` on results the index actually
 /// returns; not a substitute for comparing scores within a tolerance,
 /// and not enough to key a map.
+///
+/// When a search ran with [`SearchOptions::initial_threshold`], a query
+/// row whose floor excluded candidates holds fewer than `k` real
+/// results; the tail of such a row is padded with sentinel entries
+/// (`score == f32::NEG_INFINITY`, `index == -1`). Searches without a
+/// floor never produce padding.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResults {
     /// Scores, row-major `nq × k`, sorted descending within each row
@@ -628,6 +635,59 @@ impl SearchResults {
     /// If the row is out of bounds (`qi >= nq` with `k > 0`).
     pub fn indices_for_query(&self, qi: usize) -> &[i64] {
         &self.indices[qi * self.k..(qi + 1) * self.k]
+    }
+}
+
+/// Options for [`TurboQuantIndex::search_with_options`].
+///
+/// `#[non_exhaustive]` so future options are not a breaking change:
+/// construct with [`SearchOptions::new`] / [`Default`] and refine with the
+/// builder-style `with_*` methods.
+#[derive(Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct SearchOptions<'a> {
+    /// Per-slot allow mask; same semantics and panics as
+    /// [`TurboQuantIndex::search_with_mask`]. `None` searches every slot.
+    pub mask: Option<&'a [bool]>,
+
+    /// Initial top-k threshold (a score floor). When `Some(f)`, the
+    /// search collects only candidates scoring `>= f`, exactly as if `k`
+    /// results at score `f` had already been observed: the pruning
+    /// cutoff starts at the floor instead of only rising once the local
+    /// top-k fills, so callers that already hold scored candidates (a
+    /// previous result set being re-queried after appends, the running
+    /// merged k-th best while searching several indexes, a cheap first
+    /// pass in a cascade) skip work the scan would otherwise redo.
+    ///
+    /// For any `f` that is a true lower bound on the final k-th best
+    /// score, results are identical to an unseeded search. For a higher
+    /// `f`, the result set is the unseeded result set filtered to
+    /// scores `>= f`; ties exactly at the floor survive. A query row
+    /// whose floor excludes candidates holds fewer than `k` real
+    /// results and is padded — see [`SearchResults`].
+    ///
+    /// `None` and `Some(f32::NEG_INFINITY)` are equivalent (no floor).
+    pub initial_threshold: Option<f32>,
+}
+
+impl<'a> SearchOptions<'a> {
+    /// Default options: no mask, no floor — equivalent to
+    /// [`TurboQuantIndex::search`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Restrict the search to slots whose `mask` entry is `true`.
+    pub fn with_mask(mut self, mask: &'a [bool]) -> Self {
+        self.mask = Some(mask);
+        self
+    }
+
+    /// Seed the top-k cutoff with a score floor. See
+    /// [`SearchOptions::initial_threshold`].
+    pub fn with_initial_threshold(mut self, floor: f32) -> Self {
+        self.initial_threshold = Some(floor);
+        self
     }
 }
 
@@ -2197,6 +2257,52 @@ impl TurboQuantIndex {
         k: usize,
         mask: Option<&[bool]>,
     ) -> Result<SearchResults, SearchError> {
+        let mut options = SearchOptions::new();
+        options.mask = mask;
+        self.try_search_with_options(queries, k, options)
+    }
+
+    /// Run a top-`k` search with [`SearchOptions`]: an optional slot mask
+    /// and an optional initial top-k threshold (score floor).
+    ///
+    /// With default options this is [`Self::search`]; with only a mask it
+    /// is [`Self::search_with_mask`]. See
+    /// [`SearchOptions::initial_threshold`] for the floor semantics —
+    /// with a floor set, query rows may contain fewer than `k` real
+    /// results and are padded with `(f32::NEG_INFINITY, -1)` entries
+    /// (see [`SearchResults`]).
+    ///
+    /// # Panics
+    ///
+    /// - If `options.initial_threshold` is NaN.
+    /// - Plus the same panics as [`Self::search_with_mask`].
+    pub fn search_with_options(
+        &self,
+        queries: &[f32],
+        k: usize,
+        options: SearchOptions<'_>,
+    ) -> SearchResults {
+        self.try_search_with_options(queries, k, options)
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// [`Self::search_with_options`] as a `Result`: the non-panicking
+    /// form, with the same validation as [`Self::try_search_with_mask`]
+    /// (it is the single implementation both mask entry points delegate
+    /// to). The NaN check on `initial_threshold` stays an assert in both
+    /// forms: it is API misuse, not input data.
+    pub fn try_search_with_options(
+        &self,
+        queries: &[f32],
+        k: usize,
+        options: SearchOptions<'_>,
+    ) -> Result<SearchResults, SearchError> {
+        let mask = options.mask;
+        let initial_threshold = options.initial_threshold.unwrap_or(f32::NEG_INFINITY);
+        assert!(
+            !initial_threshold.is_nan(),
+            "initial_threshold must not be NaN",
+        );
         // A lazy index that's never seen an add returns an empty result
         // shaped according to the caller's query count (best effort: we
         // don't know dim, so nq is 0). Matches Python users' expectation
@@ -2373,6 +2479,7 @@ impl TurboQuantIndex {
                 n_blocks,
                 k,
                 mask_slice,
+                initial_threshold,
             );
             per_block.push((base, scores, indices));
         }
@@ -2401,10 +2508,14 @@ impl TurboQuantIndex {
             for (base, block_scores, block_indices) in &per_block {
                 let kb = block_scores.len() / nq;
                 for j in 0..kb {
-                    merged.push((
-                        block_scores[qi * kb + j],
-                        block_indices[qi * kb + j] + *base as i64,
-                    ));
+                    // A floor leaves rows padded with (NEG_INFINITY, -1)
+                    // sentinels; rebasing one would mint a fake slot
+                    // `base - 1`, so padding never enters the merge.
+                    let idx = block_indices[qi * kb + j];
+                    if idx < 0 {
+                        continue;
+                    }
+                    merged.push((block_scores[qi * kb + j], idx + *base as i64));
                 }
             }
             // Descending by score, ascending by slot on a tie — the same
@@ -2415,6 +2526,13 @@ impl TurboQuantIndex {
             for &(s, i) in merged.iter().take(effective_k) {
                 scores.push(s);
                 indices.push(i);
+            }
+            // A floor can leave fewer than `effective_k` survivors across
+            // every block; rows stay fixed-width, padded with the same
+            // sentinels the single-block path returns.
+            for _ in merged.len()..effective_k {
+                scores.push(f32::NEG_INFINITY);
+                indices.push(-1);
             }
         }
 
@@ -4159,6 +4277,13 @@ mod x86_scalar_fallback_tests {
     use crate::search::FORCE_SCALAR_FALLBACK;
     use std::sync::atomic::Ordering;
 
+    // FORCE_SCALAR_FALLBACK is process-global and cargo runs test
+    // threads in parallel, so the tests toggling it must not overlap.
+    // Set-membership comparisons survive a mid-test flip (either path
+    // returns a correct top-k); the seeded-floor test compares scores
+    // bitwise and does not.
+    static SCALAR_FLAG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn unit_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
         let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
         let mut out = vec![0.0f32; n * dim];
@@ -4186,6 +4311,7 @@ mod x86_scalar_fallback_tests {
 
     #[test]
     fn scalar_fallback_matches_simd_topk() {
+        let _serialize = SCALAR_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dim = 64;
         let n = 600;
         let nq = 12;
@@ -4208,6 +4334,63 @@ mod x86_scalar_fallback_tests {
                 topk_sets(&simd.indices, nq, simd.k),
                 topk_sets(&scalar.indices, nq, scalar.k),
                 "bits={bits}: scalar fallback returned a different top-k than SIMD",
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_fallback_honors_initial_threshold_like_simd() {
+        // The floor gate lives in every kernel variant; this pins the
+        // scalar fallback (score_query_into_heap) to the same seeded
+        // semantics the SIMD kernels get from the integration tests.
+        let _serialize = SCALAR_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dim = 64;
+        let n = 700;
+        let nq = 6;
+        let k = 12;
+        let idx = {
+            let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+            idx.add(&unit_vectors(n, dim, 33));
+            idx
+        };
+        let queries = unit_vectors(nq, dim, 44);
+
+        FORCE_SCALAR_FALLBACK.store(true, Ordering::Relaxed);
+        let baseline = idx.search(&queries, k);
+        // Floor above each row's rank-2 score: exactly the candidates
+        // scoring >= it survive, the rest of the row is padding.
+        let floor = baseline.scores_for_query(0)[2];
+        let seeded = idx.search_with_options(
+            &queries,
+            k,
+            crate::SearchOptions::new().with_initial_threshold(floor),
+        );
+        FORCE_SCALAR_FALLBACK.store(false, Ordering::Relaxed);
+
+        assert_eq!(seeded.k, baseline.k);
+        for qi in 0..nq {
+            let mut expected: Vec<(u32, i64)> = baseline
+                .scores_for_query(qi)
+                .iter()
+                .zip(baseline.indices_for_query(qi))
+                .filter(|(&s, _)| s >= floor)
+                .map(|(&s, &i)| (s.to_bits(), i))
+                .collect();
+            expected.extend(
+                std::iter::repeat((f32::NEG_INFINITY.to_bits(), -1i64))
+                    .take(k - expected.len()),
+            );
+            expected.sort_unstable();
+            let mut got: Vec<(u32, i64)> = seeded
+                .scores_for_query(qi)
+                .iter()
+                .zip(seeded.indices_for_query(qi))
+                .map(|(&s, &i)| (s.to_bits(), i))
+                .collect();
+            got.sort_unstable();
+            assert_eq!(
+                expected, got,
+                "row {qi}: scalar fallback seeded result is not the floor-filtered baseline",
             );
         }
     }
