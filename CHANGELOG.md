@@ -595,6 +595,22 @@ appears under each surface it touches.
   calibration. Invalid calibrations are rejected with the new
   `ConstructError::CalibrationLengthMismatch` /
   `CalibrationShiftNotFinite` / `CalibrationScaleNotPositive` variants.
+- **Seeded top-k threshold.** `TurboQuantIndex::search_with_options` takes
+  a new `SearchOptions` (slot mask plus optional `initial_threshold`): the
+  search collects only candidates scoring at or above the threshold,
+  exactly as if `k` results at that score had already been observed, so
+  the pruning cutoff is live from the first block instead of only after
+  the local top-k fills. Callers that already hold scored candidates
+  (re-querying after appends, merging across several indexes, cascaded
+  retrieval) skip work the scan would otherwise redo. For any threshold
+  that is a true lower bound on the final k-th best score, results are
+  identical to an unseeded search; ties exactly at the floor survive. A
+  query row whose floor excludes candidates is padded to `k` with
+  `(f32::NEG_INFINITY, -1)` sentinel entries, documented on
+  `SearchResults`. `search` / `search_with_mask` are unchanged in
+  signature and behavior (with no floor the seeded cutoff is
+  `NEG_INFINITY`, which every kernel comparison treats exactly as
+  before).
 
 - **The unchecked low-level kernels are no longer public.**
   **Breaking (Rust crate).** `codebook::codebook`, `encode::encode`,
