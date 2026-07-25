@@ -530,6 +530,10 @@ unsafe fn search_multi_query_avx2(
                         if !mask_allows(m, base_vec + lane) { continue; }
                     }
                     let score = block_out[lane];
+                    // Floor gate: while filling, *hmin still holds the
+                    // caller's floor seed (NEG_INFINITY when no floor, so
+                    // this is a no-op then).
+                    if score <= *hmin { continue; }
                     if *sz < k {
                         hs[*sz] = score;
                         hi[*sz] = (base_vec + lane) as u64;
@@ -1028,6 +1032,9 @@ unsafe fn avx2_post_flush_heap_update(
                 if !mask_allows(am, base_vec + lane) { continue; }
             }
             let score = block_out[lane];
+            // Floor gate: while filling, *hmin still holds the caller's
+            // floor seed (NEG_INFINITY when no floor: no-op).
+            if score <= *hmin { continue; }
             if *sz < k {
                 hs[*sz] = score;
                 hi[*sz] = (base_vec + lane) as u64;
@@ -1218,6 +1225,12 @@ unsafe fn neon_block_topk_update(
             if !mask_allows(am, base_vec + lane) {
                 continue;
             }
+        }
+        // Floor gate: while filling, *hmin still holds the caller's floor
+        // seed (NEG_INFINITY when no floor: no-op). Once full, this is the
+        // same strict comparison the else-if below applies.
+        if s <= *hmin {
+            continue;
         }
         if *sz < k {
             hs[*sz] = s;
@@ -1443,6 +1456,29 @@ pub(crate) fn block_pair_has_allowed(mask: Option<&[u64]>, base_vec_pair: usize)
     }
 }
 
+/// Largest `f32` strictly less than `x` (one ULP down), with
+/// `next_down(NEG_INFINITY) = NEG_INFINITY` and `next_down(+INFINITY) =
+/// f32::MAX`. Hand-rolled because `f32::next_down` stabilized in Rust
+/// 1.86 and the crate's MSRV is 1.81. `x` must not be NaN (the public
+/// API rejects NaN thresholds before reaching here).
+pub(crate) fn next_down_f32(x: f32) -> f32 {
+    debug_assert!(!x.is_nan());
+    if x == f32::NEG_INFINITY {
+        return x;
+    }
+    if x == 0.0 {
+        // Covers +0.0 and -0.0: the next value down is -f32::MIN_POSITIVE's
+        // smallest subnormal.
+        return -f32::from_bits(1);
+    }
+    let bits = x.to_bits();
+    if x > 0.0 {
+        f32::from_bits(bits - 1)
+    } else {
+        f32::from_bits(bits + 1)
+    }
+}
+
 /// Per-query scalar scoring writing into caller-provided heap arrays.
 /// Used by the non-x86_64 / non-aarch64 scalar fallback at the bottom
 /// of `search`, AND as the x86_64 fallback inside the SIMD-dispatch
@@ -1513,6 +1549,12 @@ fn score_query_into_heap(
                 score += qlut_scale * qlut_uint8[g * 32 + 16 + lo] as f32;
             }
             score *= vec_scales[vi];
+            // Floor gate: while filling, *heap_min still holds the caller's
+            // floor seed (NEG_INFINITY when no floor: no-op). Once full,
+            // this is the same strict comparison the else-if below applies.
+            if score <= *heap_min {
+                continue;
+            }
             if *heap_sz < k {
                 heap_s[*heap_sz] = score;
                 heap_i[*heap_sz] = vi as u64;
@@ -1579,6 +1621,16 @@ fn calibrate_queries(
 /// contribute to the top-k. The returned per-query result count is
 /// `min(k, popcount(mask))`.
 ///
+/// `initial_threshold`: score floor seeding the top-k cutoff. Candidates
+/// scoring strictly below it are never collected, exactly as if `k`
+/// results at that score had already been observed; ties at the floor
+/// survive. `f32::NEG_INFINITY` disables the floor (every insert/skip
+/// site compares against a cutoff that starts at the floor seed, and
+/// `score <= NEG_INFINITY` is false for every real score, so the
+/// disabled case is behavior-identical to the pre-floor kernel). A row
+/// whose floor excludes candidates holds fewer than `k` real results
+/// and is padded to `k` with `(NEG_INFINITY, -1)` entries.
+///
 /// Returns (scores_flat, indices_flat) each of length nq * effective_k.
 ///
 /// Crate-internal (soundness-critical). The unsafe SIMD kernels index
@@ -1605,6 +1657,7 @@ pub(crate) fn search(
     n_blocks: usize,
     k: usize,
     mask: Option<&[u64]>,
+    initial_threshold: f32,
 ) -> (Vec<f32>, Vec<i64>) {
     let n_allowed = match mask {
         Some(m) => m.iter().map(|w| w.count_ones() as usize).sum::<usize>(),
@@ -1614,6 +1667,11 @@ pub(crate) fn search(
     if k == 0 {
         return (Vec::new(), Vec::new());
     }
+    // The heap cutoffs are seeded one ULP below the floor so acceptance
+    // (`score > cutoff`) keeps scores exactly equal to the floor — the
+    // documented "ties at the floor survive" contract, mirroring the
+    // strict `>` the full-heap path already uses.
+    let floor_seed = next_down_f32(initial_threshold);
     let n_byte_groups = dim / (8 / bits);
 
     // Rotate each query row in place with the same deterministic
@@ -1678,9 +1736,12 @@ pub(crate) fn search(
         range_vecs: usize,
         k: usize,
         mask: Option<&[u64]>,
+        floor_seed: f32,
     ) -> Vec<(f32, u64)> {
         let mut heap: Vec<(f32, u64)> = Vec::with_capacity(k);
-        let mut heap_min = f32::NEG_INFINITY;
+        // The caller's floor (NEG_INFINITY when unseeded): the cutoff in
+        // effect while the heap fills, so sub-floor scores never enter.
+        let mut heap_min = floor_seed;
         let mut heap_mi = 0usize;
         let mut out = [0.0f32; BLOCK];
         for b in 0..range_blocks {
@@ -1702,6 +1763,11 @@ pub(crate) fn search(
                     continue;
                 }
                 if heap.len() < k {
+                    // Floor gate while filling: heap_min still holds the
+                    // floor seed (NEG_INFINITY when unseeded: no-op).
+                    if s <= heap_min {
+                        continue;
+                    }
                     heap.push((s, (base + lane) as u64));
                     if heap.len() == k {
                         heap_mi = 0;
@@ -1741,6 +1807,7 @@ pub(crate) fn search(
         n_blocks: usize,
         k: usize,
         mask: Option<&[u64]>,
+        floor_seed: f32,
     ) -> (Vec<f32>, Vec<i64>) {
         let n_threads = rayon::current_num_threads().max(1);
         let blocks_per_range = block_range_stride(n_blocks, n_threads);
@@ -1765,12 +1832,12 @@ pub(crate) fn search(
                 let heap = if mask_slice.is_some() {
                     scan_range_neon::<true>(
                         codes, lut, n_byte_groups, scales_slice, block_bytes,
-                        range_blocks, range_vecs, k, mask_slice,
+                        range_blocks, range_vecs, k, mask_slice, floor_seed,
                     )
                 } else {
                     scan_range_neon::<false>(
                         codes, lut, n_byte_groups, scales_slice, block_bytes,
-                        range_blocks, range_vecs, k, None,
+                        range_blocks, range_vecs, k, None, floor_seed,
                     )
                 };
                 heap.into_iter()
@@ -1795,7 +1862,7 @@ pub(crate) fn search(
         if nq == 1 && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS {
             vec![search_single_query_block_parallel_neon(
                 blocked_codes, &query_luts[0], n_byte_groups, vec_scales,
-                n_vectors, n_blocks, k, mask,
+                n_vectors, n_blocks, k, mask, floor_seed,
             )]
         } else {
         // ARM: 4-query fused scoring (shares code loads + nibble splits
@@ -1843,7 +1910,9 @@ pub(crate) fn search(
                 let mut heap_s = vec![vec![f32::NEG_INFINITY; k]; batch_size];
                 let mut heap_i = vec![vec![0u64; k]; batch_size];
                 let mut heap_sz = [0usize; QBS];
-                let mut heap_min = [f32::NEG_INFINITY; QBS];
+                // Seed the running minimum with the caller's floor so
+                // sub-floor scores never enter the heap, fill phase included.
+                let mut heap_min = [floor_seed; QBS];
                 let mut heap_mi = [0usize; QBS];
 
                 if batch_size == QBS {
@@ -1982,6 +2051,7 @@ pub(crate) fn search(
         k: usize,
         use_avx512: bool,
         mask: Option<&[u64]>,
+        floor_seed: f32,
     ) -> (Vec<f32>, Vec<i64>) {
         let n_threads = rayon::current_num_threads().max(1);
         // Whole blocks per range, at least 64 blocks (2k vectors) each,
@@ -2005,7 +2075,10 @@ pub(crate) fn search(
                 let mut heap_scores = vec![vec![f32::NEG_INFINITY; k]];
                 let mut heap_indices = vec![vec![0u64; k]];
                 let mut heap_sizes = vec![0usize];
-                let mut heap_mins = vec![f32::NEG_INFINITY];
+                // Seeded with the caller's floor (NEG_INFINITY when
+                // unseeded) so each range prunes below it from the first
+                // block, same as the batch path's heap_mins.
+                let mut heap_mins = vec![floor_seed];
                 let mut heap_min_idxs = vec![0usize];
                 // SAFETY: feature presence checked by the caller once.
                 unsafe {
@@ -2073,7 +2146,7 @@ pub(crate) fn search(
         {
             vec![search_single_query_block_parallel(
                 blocked_codes, &query_luts[0], n_byte_groups, vec_scales,
-                n_vectors, n_blocks, k, use_avx512, mask,
+                n_vectors, n_blocks, k, use_avx512, mask, floor_seed,
             )]
         } else {
         const NQ_BATCH: usize = 4;
@@ -2149,7 +2222,11 @@ pub(crate) fn search(
                 let mut heap_indices: Vec<Vec<u64>> = (0..batch_nq)
                     .map(|_| vec![0u64; k]).collect();
                 let mut heap_sizes = vec![0usize; batch_nq];
-                let mut heap_mins = vec![f32::NEG_INFINITY; batch_nq];
+                // Seeded with the floor (NEG_INFINITY when disabled): the
+                // kernels' insert gates and block prefilters compare
+                // against these, so a seed above NEG_INFINITY prunes from
+                // the first block instead of only after the heap fills.
+                let mut heap_mins = vec![floor_seed; batch_nq];
                 let mut heap_min_idxs = vec![0usize; batch_nq];
 
                 #[cfg(test)]
@@ -2269,7 +2346,7 @@ pub(crate) fn search(
                 let mut heap_s = vec![f32::NEG_INFINITY; k];
                 let mut heap_i = vec![0u64; k];
                 let mut heap_sz = 0usize;
-                let mut heap_min = f32::NEG_INFINITY;
+                let mut heap_min = floor_seed;
                 let mut heap_mi = 0usize;
                 score_query_into_heap(
                     &qlut.uint8_luts,
@@ -2297,7 +2374,10 @@ pub(crate) fn search(
         results
     };
 
-    // Flatten into (scores, indices)
+    // Flatten into (scores, indices). Rows can come up short only when a
+    // floor excluded candidates; pad them to k with an explicit
+    // (NEG_INFINITY, -1) sentinel so a padding entry can never be
+    // mistaken for slot 0.
     let mut all_scores = Vec::with_capacity(nq * k);
     let mut all_indices = Vec::with_capacity(nq * k);
     for (s, i) in &results {
@@ -2305,7 +2385,7 @@ pub(crate) fn search(
         all_scores.extend_from_slice(s);
         all_scores.extend(std::iter::repeat(f32::NEG_INFINITY).take(pad));
         all_indices.extend_from_slice(i);
-        all_indices.extend(std::iter::repeat(0i64).take(pad));
+        all_indices.extend(std::iter::repeat(-1i64).take(pad));
     }
 
     (all_scores, all_indices)
@@ -2482,5 +2562,37 @@ mod gate_tests {
 
         // And any combination stays serial.
         assert!(serial_required(true, false, true));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_down_f32;
+
+    #[test]
+    fn next_down_f32_matches_contract() {
+        // One ULP below a positive normal.
+        assert!(next_down_f32(1.0) < 1.0);
+        assert_eq!(next_down_f32(1.0), f32::from_bits(1.0f32.to_bits() - 1));
+        // One ULP below a negative normal moves further negative.
+        assert!(next_down_f32(-1.0) < -1.0);
+        // Zeroes (both signs) step to the smallest negative subnormal.
+        assert!(next_down_f32(0.0) < 0.0);
+        assert!(next_down_f32(-0.0) < 0.0);
+        // Infinities: NEG_INFINITY is a fixed point; +INFINITY caps at MAX.
+        assert_eq!(next_down_f32(f32::NEG_INFINITY), f32::NEG_INFINITY);
+        assert_eq!(next_down_f32(f32::INFINITY), f32::MAX);
+        // The defining property on a spread of values: strictly less, and
+        // nothing representable in between (next value up restores x).
+        for &x in &[1e-30f32, 0.5, 1.0, 3.5, 1e30, f32::MAX, -2.5e-7, -7e12] {
+            let d = next_down_f32(x);
+            assert!(d < x, "next_down({x}) = {d} is not strictly less");
+            let restored = if d < 0.0 {
+                f32::from_bits(d.to_bits() - 1)
+            } else {
+                f32::from_bits(d.to_bits() + 1)
+            };
+            assert_eq!(restored, x, "next_down({x}) skipped a representable value");
+        }
     }
 }
