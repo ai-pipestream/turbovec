@@ -1461,6 +1461,37 @@ pub(crate) fn block_pair_has_allowed(mask: Option<&[u64]>, base_vec_pair: usize)
 /// f32::MAX`. Hand-rolled because `f32::next_down` stabilized in Rust
 /// 1.86 and the crate's MSRV is 1.81. `x` must not be NaN (the public
 /// API rejects NaN thresholds before reaching here).
+
+/// Blocks scanned between shared-floor synchronizations in the
+/// single-query parallel paths. Small enough that a strong floor found
+/// by one range reaches the others early in their scans; large enough
+/// that the per-sync kernel-call overhead is negligible (256 blocks =
+/// 8192 vectors per sub-chunk).
+const SHARED_FLOOR_SYNC_BLOCKS: usize = 256;
+
+/// Total-order key for finite f32 scores, so a shared floor can live in
+/// an `AtomicU32` and only ever rise via `fetch_max`: the sign-flip map
+/// is strictly monotonic over all non-NaN floats, so comparing keys
+/// compares scores. Scores here come from the kernels; NaN never enters.
+#[inline]
+fn score_key(s: f32) -> u32 {
+    let b = s.to_bits();
+    if b & 0x8000_0000 != 0 {
+        !b
+    } else {
+        b | 0x8000_0000
+    }
+}
+
+/// Inverse of [`score_key`].
+#[inline]
+fn score_from_key(key: u32) -> f32 {
+    f32::from_bits(if key & 0x8000_0000 != 0 {
+        key & 0x7FFF_FFFF
+    } else {
+        !key
+    })
+}
 pub(crate) fn next_down_f32(x: f32) -> f32 {
     debug_assert!(!x.is_nan());
     if x == f32::NEG_INFINITY {
@@ -1813,36 +1844,61 @@ pub(crate) fn search(
         let blocks_per_range = block_range_stride(n_blocks, n_threads);
         let ranges: Vec<usize> = (0..n_blocks).step_by(blocks_per_range).collect();
         let block_bytes = n_byte_groups * BLOCK;
+        // Shared-floor protocol between ranges; see the x86 twin for the
+        // reasoning. Results are bitwise-identical to a single-floor scan.
+        let shared_floor = std::sync::atomic::AtomicU32::new(score_key(floor_seed));
         let mut candidates: Vec<(f32, u64)> = ranges
             .into_par_iter()
             .flat_map(|block_start| {
                 let range_blocks = blocks_per_range.min(n_blocks - block_start);
-                let vec_start = block_start * BLOCK;
-                let range_vecs = (range_blocks * BLOCK).min(n_vectors - vec_start);
-                let codes = &blocked_codes
-                    [block_start * block_bytes..(block_start + range_blocks) * block_bytes];
-                let scales_slice = &vec_scales[vec_start..vec_start + range_vecs];
-                let mask_slice = mask.map(|m| &m[vec_start / 64..]);
-                // Monomorphized on mask presence: the unmasked path must
-                // compile to the same lane loop it did before the mask
-                // was threaded through, with no per-lane branch and
-                // nothing inhibiting the loop's unrolling. Sharing one
-                // loop with a loop-invariant `Option` check measured ~18%
-                // slower unmasked at one thread.
-                let heap = if mask_slice.is_some() {
-                    scan_range_neon::<true>(
-                        codes, lut, n_byte_groups, scales_slice, block_bytes,
-                        range_blocks, range_vecs, k, mask_slice, floor_seed,
-                    )
-                } else {
-                    scan_range_neon::<false>(
-                        codes, lut, n_byte_groups, scales_slice, block_bytes,
-                        range_blocks, range_vecs, k, None, floor_seed,
-                    )
-                };
-                heap.into_iter()
-                    .map(|(s, i)| (s, i + vec_start as u64))
-                    .collect::<Vec<_>>()
+                let mut best: Vec<(f32, u64)> = Vec::with_capacity(2 * k);
+                let mut sub = 0usize;
+                while sub < range_blocks {
+                    let sub_blocks = SHARED_FLOOR_SYNC_BLOCKS.min(range_blocks - sub);
+                    let abs_block = block_start + sub;
+                    let vec_start = abs_block * BLOCK;
+                    let sub_vecs = (sub_blocks * BLOCK).min(n_vectors - vec_start);
+                    let codes = &blocked_codes
+                        [abs_block * block_bytes..(abs_block + sub_blocks) * block_bytes];
+                    let scales_slice = &vec_scales[vec_start..vec_start + sub_vecs];
+                    let mask_slice = mask.map(|m| &m[vec_start / 64..]);
+                    let adopted = next_down_f32(score_from_key(
+                        shared_floor.load(std::sync::atomic::Ordering::Relaxed),
+                    ))
+                    .max(floor_seed);
+                    // Monomorphized on mask presence: the unmasked path must
+                    // compile to the same lane loop it did before the mask
+                    // was threaded through, with no per-lane branch and
+                    // nothing inhibiting the loop's unrolling. Sharing one
+                    // loop with a loop-invariant `Option` check measured ~18%
+                    // slower unmasked at one thread.
+                    let heap = if mask_slice.is_some() {
+                        scan_range_neon::<true>(
+                            codes, lut, n_byte_groups, scales_slice, block_bytes,
+                            sub_blocks, sub_vecs, k, mask_slice, adopted,
+                        )
+                    } else {
+                        scan_range_neon::<false>(
+                            codes, lut, n_byte_groups, scales_slice, block_bytes,
+                            sub_blocks, sub_vecs, k, None, adopted,
+                        )
+                    };
+                    best.extend(heap.into_iter().map(|(s, i)| (s, i + vec_start as u64)));
+                    if best.len() >= k {
+                        best.sort_unstable_by(|a, b| {
+                            b.0.partial_cmp(&a.0)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then_with(|| a.1.cmp(&b.1))
+                        });
+                        best.truncate(k);
+                        shared_floor.fetch_max(
+                            score_key(best[k - 1].0),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                    sub += sub_blocks;
+                }
+                best
             })
             .collect();
         candidates.sort_unstable_by(|a, b| {
@@ -2059,53 +2115,83 @@ pub(crate) fn search(
         let blocks_per_range = block_range_stride(n_blocks, n_threads);
         let ranges: Vec<usize> = (0..n_blocks).step_by(blocks_per_range).collect();
         let block_bytes = n_byte_groups * BLOCK;
+        // The distributed floor-sharing protocol collapsed into one
+        // atomic: each range scans in sub-chunks, and between sub-chunks
+        // it adopts the highest k-th-best any range has published and
+        // publishes its own. Floors only rise and only ever prune scores
+        // provably outside the top k (next_down keeps boundary ties, as
+        // for the caller's seed), so results are bitwise-identical to a
+        // single-floor scan.
+        let shared_floor = std::sync::atomic::AtomicU32::new(score_key(floor_seed));
         let mut candidates: Vec<(f32, u64)> = ranges
             .into_par_iter()
             .flat_map(|block_start| {
                 let range_blocks = blocks_per_range.min(n_blocks - block_start);
-                let vec_start = block_start * BLOCK;
-                let range_vecs = (range_blocks * BLOCK).min(n_vectors - vec_start);
-                let codes =
-                    &blocked_codes[block_start * block_bytes..(block_start + range_blocks) * block_bytes];
-                let scales_slice = &vec_scales[vec_start..vec_start + range_vecs];
-                let mask_slice = mask.map(|m| &m[vec_start / 64..]);
                 let lut_refs = [lut.uint8_luts.as_slice(); 4];
                 let scale_vals = [lut.scale; 4];
                 let bias_vals = [lut.bias; 4];
-                let mut heap_scores = vec![vec![f32::NEG_INFINITY; k]];
-                let mut heap_indices = vec![vec![0u64; k]];
-                let mut heap_sizes = vec![0usize];
-                // Seeded with the caller's floor (NEG_INFINITY when
-                // unseeded) so each range prunes below it from the first
-                // block, same as the batch path's heap_mins.
-                let mut heap_mins = vec![floor_seed];
-                let mut heap_min_idxs = vec![0usize];
-                // SAFETY: feature presence checked by the caller once.
-                unsafe {
-                    if use_avx512 {
-                        search_multi_query_avx512bw(
-                            codes, &lut_refs, &scale_vals, &bias_vals,
-                            n_byte_groups, scales_slice, range_vecs,
-                            1, k, mask_slice,
-                            &mut heap_scores, &mut heap_indices,
-                            &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
-                        );
-                    } else {
-                        search_multi_query_avx2(
-                            codes, &lut_refs, &scale_vals, &bias_vals,
-                            n_byte_groups, scales_slice, range_vecs,
-                            1, k, mask_slice,
-                            &mut heap_scores, &mut heap_indices,
-                            &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                let mut best: Vec<(f32, u64)> = Vec::with_capacity(2 * k);
+                let mut sub = 0usize;
+                while sub < range_blocks {
+                    let sub_blocks = SHARED_FLOOR_SYNC_BLOCKS.min(range_blocks - sub);
+                    let abs_block = block_start + sub;
+                    let vec_start = abs_block * BLOCK;
+                    let sub_vecs = (sub_blocks * BLOCK).min(n_vectors - vec_start);
+                    let codes = &blocked_codes
+                        [abs_block * block_bytes..(abs_block + sub_blocks) * block_bytes];
+                    let scales_slice = &vec_scales[vec_start..vec_start + sub_vecs];
+                    let mask_slice = mask.map(|m| &m[vec_start / 64..]);
+                    let adopted = next_down_f32(score_from_key(
+                        shared_floor.load(std::sync::atomic::Ordering::Relaxed),
+                    ))
+                    .max(floor_seed);
+                    let mut heap_scores = vec![vec![f32::NEG_INFINITY; k]];
+                    let mut heap_indices = vec![vec![0u64; k]];
+                    let mut heap_sizes = vec![0usize];
+                    let mut heap_mins = vec![adopted];
+                    let mut heap_min_idxs = vec![0usize];
+                    // SAFETY: feature presence checked by the caller once.
+                    unsafe {
+                        if use_avx512 {
+                            search_multi_query_avx512bw(
+                                codes, &lut_refs, &scale_vals, &bias_vals,
+                                n_byte_groups, scales_slice, sub_vecs,
+                                1, k, mask_slice,
+                                &mut heap_scores, &mut heap_indices,
+                                &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                            );
+                        } else {
+                            search_multi_query_avx2(
+                                codes, &lut_refs, &scale_vals, &bias_vals,
+                                n_byte_groups, scales_slice, sub_vecs,
+                                1, k, mask_slice,
+                                &mut heap_scores, &mut heap_indices,
+                                &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                            );
+                        }
+                    }
+                    let sz = heap_sizes[0];
+                    best.extend(
+                        heap_scores[0][..sz]
+                            .iter()
+                            .zip(heap_indices[0][..sz].iter())
+                            .map(|(&s, &i)| (s, i + vec_start as u64)),
+                    );
+                    if best.len() >= k {
+                        best.sort_unstable_by(|a, b| {
+                            b.0.partial_cmp(&a.0)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then_with(|| a.1.cmp(&b.1))
+                        });
+                        best.truncate(k);
+                        shared_floor.fetch_max(
+                            score_key(best[k - 1].0),
+                            std::sync::atomic::Ordering::Relaxed,
                         );
                     }
+                    sub += sub_blocks;
                 }
-                let sz = heap_sizes[0];
-                heap_scores[0][..sz]
-                    .iter()
-                    .zip(heap_indices[0][..sz].iter())
-                    .map(|(&s, &i)| (s, i + vec_start as u64))
-                    .collect::<Vec<_>>()
+                best
             })
             .collect();
         // Deterministic merge: score desc, index asc on ties.
