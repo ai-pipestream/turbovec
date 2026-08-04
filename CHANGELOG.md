@@ -81,6 +81,22 @@ appears under each surface it touches.
   `IdMapIndex` — always durable; when it returns, the commit is on
   stable storage.
 
+- **Streaming collector.** `TurboQuantIndex::search_streaming` /
+  `try_search_streaming` stream every candidate scoring at or above a
+  floor to a caller-supplied sink, chunk by chunk, with no top-k and no
+  heap: the only per-query state is a score floor the sink may raise as
+  the scan advances (`StreamControl::RaiseFloor`), and the sink can
+  abandon the scan (`StreamControl::Stop`). Each emission chunk (8192
+  rows of whole SIMD blocks) is scored once through the same kernel as
+  `search_with_options`, asked for every live row with the floors
+  seeded, so scores are bitwise identical to a top-k search of the same
+  query batch and nothing is ever displaced from a heap. A completed
+  scan returns `StreamSummary { completed: true }`: the certificate
+  that every candidate at or above the floor was emitted. This is the
+  collector for a coordinator that owns `k` itself and relays the
+  merged k-th best score back as the floor while several indexes scan
+  in tandem.
+
 - **Seeded top-k threshold.** `TurboQuantIndex::search_with_options` takes
   a new `SearchOptions` (slot mask plus optional `initial_threshold`): the
   search collects only candidates scoring at or above the threshold,
