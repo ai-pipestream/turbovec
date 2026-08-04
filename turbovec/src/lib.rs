@@ -518,6 +518,70 @@ impl<'a> SearchOptions<'a> {
     }
 }
 
+/// One emission from [`TurboQuantIndex::search_streaming`]: every
+/// candidate in one emission chunk, for one query, scoring at or above
+/// that query's current floor.
+///
+/// `scores` are descending; `slots` are global slot indices (the same
+/// values a [`SearchResults`] row would hold). The two slices always
+/// have the same non-zero length: empty batches are never emitted.
+#[derive(Clone, Copy, Debug)]
+pub struct StreamBatch<'a> {
+    /// Which query row (of the `nq` in the call) this batch belongs to.
+    pub query_index: usize,
+    /// First slot of the emission chunk these candidates came from.
+    /// Strictly increasing across the batches of one query.
+    pub block_base: usize,
+    /// Candidate scores, descending.
+    pub scores: &'a [f32],
+    /// Global slot indices, parallel to `scores`.
+    pub slots: &'a [i64],
+}
+
+/// Sink verdict after each [`StreamBatch`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StreamControl {
+    /// Keep scanning.
+    Continue,
+    /// Keep scanning, and raise the batch's query's floor to this value
+    /// starting with the next chunk. Values at or below the current
+    /// floor are ignored: floors only rise, because earlier chunks were
+    /// already emitted under the old floor and cannot be revisited.
+    /// Must not be NaN.
+    RaiseFloor(f32),
+    /// Abandon the whole call. Everything emitted so far stands, but
+    /// the returned summary has `completed: false`: unscanned chunks
+    /// may hold candidates above every floor.
+    Stop,
+}
+
+/// What a [`TurboQuantIndex::search_streaming`] call did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamSummary {
+    /// Number of query rows in the call.
+    pub nq: usize,
+    /// Total candidates emitted across every batch and query.
+    pub emitted: usize,
+    /// Emission chunks scored (each chunk is scored once for all
+    /// queries together, so this does not scale with `nq`).
+    pub blocks_scanned: usize,
+    /// `true` when every chunk was scanned to the end: for each query,
+    /// every live slot scoring at or above that query's floor (as it
+    /// stood when the slot's chunk was scored) was emitted. This is the
+    /// exactness certificate a caller merging several indexes waits
+    /// for. `false` means the sink stopped the scan and the emissions
+    /// are a prefix, not a certificate.
+    pub completed: bool,
+}
+
+/// Rows per emission chunk of [`TurboQuantIndex::search_streaming`]:
+/// the cadence at which the sink is consulted and floor raises bind.
+/// A multiple of 64 (whole mask words, so chunk bases fall on word
+/// boundaries) and of the SIMD block rows. 8192 preserves the batch
+/// cadence the calibration-block fork chain had, so nothing built on
+/// the batch rhythm re-tunes.
+const STREAM_CHUNK_ROWS: usize = 8192;
+
 impl TurboQuantIndex {
     /// The packed bit-plane codes, materializing them from the blocked
     /// cache if this index was v6-loaded and hasn't needed them yet.
@@ -1416,6 +1480,275 @@ impl TurboQuantIndex {
             k: effective_k,
         })
     }
+
+    /// Stream every candidate scoring at or above a floor to a sink,
+    /// chunk by chunk, with no top-k and no heap: the only per-query
+    /// state is a score floor the sink may raise as the scan advances.
+    ///
+    /// This is the collector for a caller that owns `k` itself: a
+    /// coordinator merging several indexes keeps the global k-th best
+    /// and relays it back as [`StreamControl::RaiseFloor`], so each
+    /// index emits exactly the candidates that can still matter and
+    /// nothing is lost to a shard-local cutoff. On a single index it
+    /// is "give me everything above `s`", sorted within each batch.
+    ///
+    /// Mechanics: the slot space is walked in fixed emission chunks
+    /// (`STREAM_CHUNK_ROWS` rows of whole SIMD blocks). Each chunk is
+    /// scored once (all queries together) through the same kernel as
+    /// [`Self::search_with_options`], asked for every live row of the
+    /// chunk with the current floors seeded, so scores are bitwise
+    /// identical to a top-k search with the same query batch and
+    /// nothing can be displaced from a heap that has room for the
+    /// whole chunk. After each chunk, one [`StreamBatch`] per query
+    /// with surviving candidates is handed to the sink; the sink's
+    /// verdict is applied before the next chunk is scored. The kernel
+    /// prunes at the minimum floor across queries; each query's
+    /// emissions are then filtered to its own floor, so per-query
+    /// floors are exact even though the scoring pass is shared.
+    ///
+    /// Emission order: scores descend within a batch; a query's batches
+    /// ascend by `block_base`; there is no global order across chunks
+    /// or queries. Merging is the caller's job, by construction.
+    ///
+    /// `options.initial_threshold` is every query's starting floor
+    /// (`None` streams the entire index); `options.mask` restricts
+    /// slots exactly as in [`Self::search_with_mask`].
+    ///
+    /// # Panics
+    ///
+    /// - If `options.initial_threshold` or a raised floor is NaN.
+    /// - Plus the same panics as [`Self::search_with_mask`].
+    pub fn search_streaming<F>(
+        &self,
+        queries: &[f32],
+        options: SearchOptions<'_>,
+        sink: F,
+    ) -> StreamSummary
+    where
+        F: FnMut(&StreamBatch<'_>) -> StreamControl,
+    {
+        self.try_search_streaming(queries, options, sink)
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// [`Self::search_streaming`] as a `Result`: the non-panicking
+    /// form, with the same validation as
+    /// [`Self::try_search_with_options`]. NaN floors stay asserts in
+    /// both forms: they are API misuse, not input data.
+    pub fn try_search_streaming<F>(
+        &self,
+        queries: &[f32],
+        options: SearchOptions<'_>,
+        sink: F,
+    ) -> Result<StreamSummary, SearchError>
+    where
+        F: FnMut(&StreamBatch<'_>) -> StreamControl,
+    {
+        self.try_search_streaming_chunked(queries, options, STREAM_CHUNK_ROWS, sink)
+    }
+
+    /// [`Self::try_search_streaming`] with an explicit emission-chunk
+    /// row count. The chunk size changes only the batch cadence, which
+    /// rows arrive together and how often floor raises can bind; never
+    /// the emitted set or the scores. Public for the integration tests,
+    /// which need small chunks to exercise multi-batch behavior on
+    /// small indexes; production callers want the default.
+    #[doc(hidden)]
+    pub fn try_search_streaming_chunked<F>(
+        &self,
+        queries: &[f32],
+        options: SearchOptions<'_>,
+        chunk_rows: usize,
+        mut sink: F,
+    ) -> Result<StreamSummary, SearchError>
+    where
+        F: FnMut(&StreamBatch<'_>) -> StreamControl,
+    {
+        assert!(
+            chunk_rows > 0 && chunk_rows % 64 == 0,
+            "chunk_rows must be a positive multiple of 64 \
+             (whole mask words of whole SIMD blocks), got {chunk_rows}",
+        );
+        let mask = options.mask;
+        let start_floor = options.initial_threshold.unwrap_or(f32::NEG_INFINITY);
+        assert!(!start_floor.is_nan(), "initial_threshold must not be NaN");
+        let done = |nq: usize, emitted: usize, chunks: usize| StreamSummary {
+            nq,
+            emitted,
+            blocks_scanned: chunks,
+            completed: true,
+        };
+        // The empty-index cases mirror `try_search_with_options`: a
+        // lazy index that has never seen an add, or an index with no
+        // vectors, has nothing to emit and completes trivially.
+        let Some(dim) = self.dim else {
+            return Ok(done(0, 0, 0));
+        };
+        let nq = queries.len() / dim;
+        if queries.len() != nq * dim {
+            return Err(SearchError::QueryBufferNotMultipleOfDim {
+                queries_len: queries.len(),
+                dim,
+            });
+        }
+        if let Some((vi, ci, v)) = first_invalid_coord(queries, dim) {
+            return Err(SearchError::InvalidQueryValue {
+                query_index: vi,
+                coord_index: ci,
+                value: v,
+            });
+        }
+        if self.n_vectors == 0 {
+            if let Some(m) = mask {
+                if !m.is_empty() {
+                    return Err(SearchError::MaskLengthMismatch {
+                        expected: 0,
+                        got: m.len(),
+                    });
+                }
+            }
+            return Ok(done(nq, 0, 0));
+        }
+        if nq == 0 {
+            return Ok(done(0, 0, 0));
+        }
+
+        let rotation = self
+            .rotation
+            .get_or_init(|| rotation::Rotation::new(dim));
+        let centroids = self.centroids.get_or_init(|| {
+            let (_, c) = codebook::codebook(self.bit_width, dim);
+            c
+        });
+        let blocked = self.blocked.get_or_init(|| {
+            let (data, n_blocks) =
+                pack::repack(self.packed(), self.n_vectors, self.bit_width, dim);
+            BlockedCache { data, n_blocks }
+        });
+
+        if let Some(m) = mask {
+            if m.len() != self.n_vectors {
+                return Err(SearchError::MaskLengthMismatch {
+                    expected: self.n_vectors,
+                    got: m.len(),
+                });
+            }
+        }
+        // Same packed-mask build as `try_search_with_options`, minus
+        // the allowed-count (streaming has no `effective_k` to clamp).
+        let packed_mask = mask.map(|m| {
+            let n_words = self.n_vectors.div_ceil(64);
+            let mut buf = Vec::with_capacity(n_words);
+            for chunk in m.chunks(64) {
+                let mut word = 0u64;
+                for (bit, &b) in chunk.iter().enumerate() {
+                    word |= (b as u64) << bit;
+                }
+                buf.push(word);
+            }
+            debug_assert_eq!(buf.len(), n_words);
+            buf
+        });
+
+        let (_, n_byte_groups, _) =
+            pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
+        let block_bytes = n_byte_groups * BLOCK;
+        let mut floors = vec![start_floor; nq];
+        let mut emitted = 0usize;
+        let mut chunks_scanned = 0usize;
+        let mut batch_scores: Vec<f32> = Vec::new();
+        let mut batch_slots: Vec<i64> = Vec::new();
+        let mut base = 0usize;
+        while base < self.n_vectors {
+            let live = chunk_rows.min(self.n_vectors - base);
+            // chunk_rows is a multiple of BLOCK, so every chunk starts
+            // on a SIMD block boundary and covers whole blocks; the
+            // blocked layout therefore slices exactly.
+            let (chunk_blocks, _, _) = pack::blocked_geometry(live, self.bit_width, dim);
+            let byte_start = (base / BLOCK) * block_bytes;
+            // chunk_rows is a multiple of 64, so the chunk's mask words
+            // slice exactly out of the full packed mask.
+            let mask_slice = packed_mask
+                .as_deref()
+                .map(|m| &m[base / 64..base / 64 + live.div_ceil(64)]);
+            // `k = live` with the floor seeded returns every candidate
+            // at or above the floor in this chunk: nothing can be
+            // displaced from a heap that has room for the whole chunk.
+            let kernel_floor = floors.iter().copied().fold(f32::INFINITY, f32::min);
+            let (scores, indices) = search::search(
+                queries,
+                nq,
+                rotation,
+                &blocked.data[byte_start..byte_start + chunk_blocks * block_bytes],
+                centroids,
+                &self.scales[base..base + live],
+                &self.tqplus_shift,
+                &self.tqplus_scale,
+                self.bit_width,
+                dim,
+                live,
+                chunk_blocks,
+                live,
+                mask_slice,
+                kernel_floor,
+            );
+            chunks_scanned += 1;
+            let kb = scores.len() / nq;
+            for qi in 0..nq {
+                batch_scores.clear();
+                batch_slots.clear();
+                for j in 0..kb {
+                    let idx = indices[qi * kb + j];
+                    if idx < 0 {
+                        continue;
+                    }
+                    let s = scores[qi * kb + j];
+                    // The kernel pruned at the min floor across
+                    // queries; this query's own floor may be higher.
+                    if s < floors[qi] {
+                        continue;
+                    }
+                    batch_scores.push(s);
+                    batch_slots.push(idx + base as i64);
+                }
+                if batch_scores.is_empty() {
+                    continue;
+                }
+                emitted += batch_scores.len();
+                let batch = StreamBatch {
+                    query_index: qi,
+                    block_base: base,
+                    scores: &batch_scores,
+                    slots: &batch_slots,
+                };
+                match sink(&batch) {
+                    StreamControl::Continue => {}
+                    StreamControl::RaiseFloor(f) => {
+                        assert!(!f.is_nan(), "raised floor must not be NaN");
+                        if f > floors[qi] {
+                            floors[qi] = f;
+                        }
+                    }
+                    StreamControl::Stop => {
+                        return Ok(StreamSummary {
+                            nq,
+                            emitted,
+                            blocks_scanned: chunks_scanned,
+                            completed: false,
+                        });
+                    }
+                }
+            }
+            base += live;
+        }
+        Ok(StreamSummary {
+            nq,
+            emitted,
+            blocks_scanned: chunks_scanned,
+            completed: true,
+        })
+    }
+
 
     /// Eagerly populate the search caches (rotation, centroids
     /// and SIMD-blocked code layout).
