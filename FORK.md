@@ -6,7 +6,7 @@ patches open up the ability to shard one index across many machines and
 have those shards collaborate on a query — the pieces turbovec needs to
 scale horizontally without changing what it computes. Both patches exist
 for that collaboration; neither alters single-index behavior when unused.
-The `turbovec-pipestream-s11` branch carries them rebased onto
+The `turbovec-pipestream-s12` branch carries them rebased onto
 upstream `main` (`scripts/sync-upstream.sh`); each sync publishes a
 new `-sN` branch because the rebase rewrites history, and
 [turbovec-search](https://github.com/ai-pipestream/turbovec-search) is
@@ -76,7 +76,7 @@ results remain byte-for-byte consistent with the original.
 | Repository | Role | Depends on |
 |---|---|---|
 | [RyanCodrai/turbovec](https://github.com/RyanCodrai/turbovec) | Upstream vector index library: 4-bit TurboQuant encoding, SIMD top-k search | — |
-| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s11` (this repo) | Patch fork carrying the patches above | upstream `main` |
+| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s12` (this repo) | Patch fork carrying the patches above | upstream `main` |
 | [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | Standalone single-node gRPC server for the upstream index, with client examples in Go, Java, Python, TypeScript, and Rust | upstream `turbovec` |
-| [ai-pipestream/turbovec-search](https://github.com/ai-pipestream/turbovec-search) | Distributed hybrid search: sharded vector + BM25 nodes, coordinator with floor sharing, write-ahead log, offline resharding | fork branch `turbovec-pipestream-s11` |
+| [ai-pipestream/turbovec-search](https://github.com/ai-pipestream/turbovec-search) | Distributed hybrid search: sharded vector + BM25 nodes, coordinator with floor sharing, write-ahead log, offline resharding | fork branch `turbovec-pipestream-s12` |
 | [ai-pipestream/grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis) | Text-analysis sidecar: sentence/token spans, term vectors, static embeddings, served over gRPC | — |
