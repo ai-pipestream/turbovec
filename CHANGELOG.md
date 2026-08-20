@@ -111,6 +111,12 @@ writes paid for embeddings before discovering the store was not created.
   encode fingerprint is re-frozen for the new container; every computed
   stage hash is unchanged, only the file hashes moved.
 
+#### Added
+
+- **Streaming scans can poll external control at every chunk boundary.** The
+  optional controlled entry point observes cancellation and floor raises even
+  when the active floor suppresses every candidate in a chunk.
+
 #### Fixed
 
 - **aarch64: crossing the single-query block-parallel gate no longer makes
@@ -501,6 +507,39 @@ writes paid for embeddings before discovering the store was not created.
   `load(path)` + `sync(path)`. New: `sync` on `TurboQuantIndex` and
   `IdMapIndex` — always durable; when it returns, the commit is on
   stable storage.
+
+- **Streaming collector.** `TurboQuantIndex::search_streaming` /
+  `try_search_streaming` stream every candidate scoring at or above a
+  floor to a caller-supplied sink, chunk by chunk, with no top-k and no
+  heap: the only per-query state is a score floor the sink may raise as
+  the scan advances (`StreamControl::RaiseFloor`), and the sink can
+  abandon the scan (`StreamControl::Stop`). Each emission chunk (8192
+  rows of whole SIMD blocks) is scored once through the same kernel as
+  `search_with_options`, asked for every live row with the floors
+  seeded, so scores are bitwise identical to a top-k search of the same
+  query batch and nothing is ever displaced from a heap. A completed
+  scan returns `StreamSummary { completed: true }`: the certificate
+  that every candidate at or above the floor was emitted. This is the
+  collector for a coordinator that owns `k` itself and relays the
+  merged k-th best score back as the floor while several indexes scan
+  in tandem.
+
+- **Seeded top-k threshold.** `TurboQuantIndex::search_with_options` takes
+  a new `SearchOptions` (slot mask plus optional `initial_threshold`): the
+  search collects only candidates scoring at or above the threshold,
+  exactly as if `k` results at that score had already been observed, so
+  the pruning cutoff is live from the first block instead of only after
+  the local top-k fills. Callers that already hold scored candidates
+  (re-querying after appends, merging across several indexes, cascaded
+  retrieval) skip work the scan would otherwise redo. For any threshold
+  that is a true lower bound on the final k-th best score, results are
+  identical to an unseeded search; ties exactly at the floor survive. A
+  query row whose floor excludes candidates is padded to `k` with
+  `(f32::NEG_INFINITY, -1)` sentinel entries, documented on
+  `SearchResults`. `search` / `search_with_mask` are unchanged in
+  signature and behavior (with no floor the seeded cutoff is
+  `NEG_INFINITY`, which every kernel comparison treats exactly as
+  before).
 
 - **Self-describing `IdMapIndex` search results (#351).** New
   `IdSearchResults { scores, ids, nq, k }` — the id-space counterpart of
@@ -1086,7 +1125,6 @@ writes paid for embeddings before discovering the store was not created.
   argument and are unaffected.
 
 #### Removed
-
 
 - **The OpenBLAS / Accelerate dependency (and `faer`, `ndarray`,
   `rand_distr`).** The only use of a BLAS backend was the rotation GEMM;
@@ -2580,7 +2618,6 @@ writes paid for embeddings before discovering the store was not created.
   ambiguous-truth-value errors. `delete` / `adelete` get the same
   treatment: a multi-element numpy array of ids previously crashed on the
   `if not ids:` emptiness test. (#157)
-
 
 - **LlamaIndex: `NE` / `NIN` metadata filters now match nodes missing the
   filtered key**, mirroring llama-index-core's `build_metadata_filter_fn`.
