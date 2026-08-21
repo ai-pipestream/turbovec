@@ -1,0 +1,38 @@
+name: Sync upstream
+
+# Keeps this fork's main a true mirror of RyanCodrai/turbovec main, and
+# keeps the tracked feat/ivf-residual mirror branch current. main carries
+# exactly one extra commit (this workflow), rebased onto upstream each run,
+# so ahead/behind stays truthful. A non-rebaseable upstream (history
+# rewrite) fails the job loudly instead of silently diverging.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/RyanCodrai/turbovec.git
+          git fetch upstream
+
+      - name: Rebase main onto upstream/main
+        run: |
+          git switch -c main origin/main
+          git rebase upstream/main
+          git push origin main
+
+      - name: Mirror feat/ivf-residual
+        run: |
+          git push --force origin upstream/feat/ivf-residual:refs/heads/feat/ivf-residual
