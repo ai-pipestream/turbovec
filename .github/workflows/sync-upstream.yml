@@ -29,7 +29,7 @@ jobs:
 
       - name: Rebase main onto upstream/main
         run: |
-          git switch -c main origin/main
+          git switch main
           git rebase upstream/main
           git push origin main
 
