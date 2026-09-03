@@ -6,7 +6,7 @@ patches open up the ability to shard one index across many machines and
 have those shards collaborate on a query — the pieces turbovec needs to
 scale horizontally without changing what it computes. The patches exist
 for that collaboration; they do not alter single-index behavior when unused.
-The `turbovec-pipestream-s19` branch carries them rebased onto
+The `turbovec-pipestream-s20` branch carries them rebased onto
 upstream `main` (`scripts/sync-upstream.sh`); each sync publishes a
 new `-sN` branch because the rebase rewrites history, and
 [protomolt-search](https://github.com/ai-pipestream/protomolt-search) is
@@ -74,6 +74,11 @@ sealed generations are the intended owner. `tests/mapped_image.rs` pins
 the equality, oversized-k clamping, the read-only contract, the
 resident-memory gate, and the legacy refusal.
 
+Mapped top-k merges each chunk's already ordered candidates into the
+already ordered global window in linear time, reusing one scratch buffer.
+It does not re-sort an expanding candidate list per chunk; result windows
+of 10,000 or more are an ordinary serving shape for the product.
+
 ## How they are used together
 
 A coordinator fans a query out to N shard indexes, all calibrated
@@ -99,7 +104,7 @@ results remain byte-for-byte consistent with the original.
 | Repository | Role | Depends on |
 |---|---|---|
 | [RyanCodrai/turbovec](https://github.com/RyanCodrai/turbovec) | Upstream vector index library: 4-bit TurboQuant encoding, SIMD top-k search | — |
-| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s19` (this repo) | Patch fork carrying the patches above | upstream `main` |
+| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s20` (this repo) | Patch fork carrying the patches above | upstream `main` |
 | [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | Standalone single-node gRPC server for the upstream index, with client examples in Go, Java, Python, TypeScript, and Rust | upstream `turbovec` |
-| [ai-pipestream/protomolt-search](https://github.com/ai-pipestream/protomolt-search) | Distributed hybrid search: sharded vector + BM25 nodes, coordinator with floor sharing, write-ahead log, offline resharding | fork branch `turbovec-pipestream-s19` |
+| [ai-pipestream/protomolt-search](https://github.com/ai-pipestream/protomolt-search) | Distributed hybrid search: sharded vector + BM25 nodes, coordinator with floor sharing, write-ahead log, offline resharding | fork branch `turbovec-pipestream-s20` |
 | [ai-pipestream/grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis) | Text-analysis sidecar: sentence/token spans, term vectors, static embeddings, served over gRPC | — |
