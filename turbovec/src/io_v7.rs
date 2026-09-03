@@ -1280,22 +1280,35 @@ fn declared_len(f: &File) -> Option<u64> {
     (geo.unit_at(0) as u64).checked_add(units)
 }
 
-/// [`load`] over an image already in memory.
-///
-/// The path loader has always read the whole file up front and then
-/// indexed around inside that buffer — v7's two header slots and block
-/// units need random access to a *slice*, not to a seekable file. So a
-/// byte image loads by exactly the same code, which is what lets
-/// `from_bytes` accept v7.
-///
-/// `src` names the image in diagnostics (a path, or something like
-/// "the byte image" for `from_bytes`).
-pub(crate) fn load_image(
-    mut raw: Vec<u8>,
-    expect_calib_gen: u64,
-    expect_kind: u8,
-    src: &str,
-) -> io::Result<V7Load> {
+/// Everything [`load_image`] decides before it touches a block unit:
+/// the superblock, the chosen commit header, the tail rows, and the
+/// pending redo ops (payloads copied out). Shared with the mapped
+/// loader (`src/mapped.rs`), which serves the units from their pages.
+pub(crate) struct ParsedImage {
+    pub geo: Geo,
+    pub dim: usize,
+    pub bit_width: usize,
+    pub kind: u8,
+    pub nonce: u64,
+    pub gen: u64,
+    pub n_vectors: usize,
+    /// Committed whole blocks.
+    pub n_blocks: usize,
+    pub total_blocks: usize,
+    pub n_tail: usize,
+    pub tail_row: usize,
+    pub row_bytes: usize,
+    pub block_bytes: usize,
+    /// The `n_tail` tail rows' records, copied out of the header.
+    pub tail: Vec<u8>,
+    pub tqplus_shift: Vec<f32>,
+    pub tqplus_scale: Vec<f32>,
+    /// Per block: `(slot, payload)` absolute writes riding the header.
+    pub ops: Vec<(usize, Vec<(usize, Vec<u8>)>)>,
+    pub pending_slots: Vec<usize>,
+}
+
+pub(crate) fn parse_image(raw: &[u8], expect_kind: u8, src: &str) -> io::Result<ParsedImage> {
     if raw.len() < 11 || &raw[..4] != V7_MAGIC {
         return Err(bad("not a v7 file"));
     }
@@ -1483,6 +1496,69 @@ pub(crate) fn load_image(
         }
         ops_owned.push((*b, owned));
     }
+    let pending_slots = chosen
+        .groups
+        .iter()
+        .flat_map(|(_, ops)| ops.iter().map(|&(s, _)| s))
+        .collect();
+    Ok(ParsedImage {
+        geo,
+        dim,
+        bit_width,
+        kind,
+        nonce,
+        gen,
+        n_vectors,
+        n_blocks,
+        total_blocks,
+        n_tail,
+        tail_row,
+        row_bytes,
+        block_bytes,
+        tail: tail_copy,
+        tqplus_shift,
+        tqplus_scale,
+        ops: ops_owned,
+        pending_slots,
+    })
+}
+
+/// [`load`] over an image already in memory.
+///
+/// The path loader has always read the whole file up front and then
+/// indexed around inside that buffer — v7's two header slots and block
+/// units need random access to a *slice*, not to a seekable file. So a
+/// byte image loads by exactly the same code, which is what lets
+/// `from_bytes` accept v7.
+///
+/// `src` names the image in diagnostics (a path, or something like
+/// "the byte image" for `from_bytes`).
+pub(crate) fn load_image(
+    mut raw: Vec<u8>,
+    expect_calib_gen: u64,
+    expect_kind: u8,
+    src: &str,
+) -> io::Result<V7Load> {
+    let ParsedImage {
+        geo,
+        dim,
+        bit_width,
+        kind,
+        nonce,
+        gen,
+        n_vectors,
+        n_blocks,
+        total_blocks,
+        n_tail,
+        tail_row,
+        row_bytes,
+        block_bytes,
+        tail: tail_copy,
+        tqplus_shift,
+        tqplus_scale,
+        ops: ops_owned,
+        pending_slots,
+    } = parse_image(&raw, expect_kind, src)?;
 
     let mut scales: Vec<f32> = Vec::with_capacity(n_vectors);
     let mut ids: Vec<u64> = Vec::with_capacity(if kind == 1 { n_vectors } else { 0 });
@@ -1570,11 +1646,7 @@ pub(crate) fn load_image(
             calib_gen: expect_calib_gen,
             nonce,
         },
-        pending_slots: chosen
-            .groups
-            .iter()
-            .flat_map(|(_, ops)| ops.iter().map(|&(s, _)| s))
-            .collect(),
+        pending_slots,
     })
 }
 

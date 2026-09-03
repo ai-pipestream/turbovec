@@ -37,6 +37,9 @@ categories = ["algorithms", "science", "compression"]
 # Kept in lockstep with turbovec-python's floor so both crates resolve to a
 # single rayon-core (see that crate's rayon note and issue #147).
 rayon = "1.12"
+# Mapped serving of v7 images (src/mapped.rs): the search cache is
+# assembled chunk by chunk from the file's pages instead of copied at open.
+memmap2 = "0.9"
 ordered-float = "4"
 rand = "0.8"
 # Pinned to an exact version: the ChaCha8 byte stream is baked into every
