@@ -232,6 +232,14 @@ impl Error for ConstructError {}
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum SearchError {
+    /// A mapped image (`TurboQuantIndex::load_mapped`) failed a check
+    /// while a chunk was assembled from its pages: a truncated unit, a
+    /// scale out of range, a file that changed under the mapping.
+    MappedImage {
+        /// The file and what failed.
+        message: String,
+    },
+
     /// The allowlist was `Some` but empty. An empty allowlist selects no
     /// slots, which is almost always a caller-side filter bug rather than
     /// a request for zero results; pass `None` to search everything.
@@ -275,6 +283,7 @@ pub enum SearchError {
 impl fmt::Display for SearchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MappedImage { message } => write!(f, "mapped image: {message}"),
             Self::AllowlistEmpty => write!(f, "allowlist is empty"),
             Self::UnknownId(id) => {
                 write!(f, "id {id} in allowlist is not present in index")
@@ -514,6 +523,11 @@ impl Error for FromPartsError {}
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum CalibrateError {
+    /// The index is a mapped image (`TurboQuantIndex::load_mapped`),
+    /// which serves reads from its file and takes no mutation; load it
+    /// with `TurboQuantIndex::load` to recalibrate it.
+    MappedReadOnly,
+
     /// The sample has fewer rows than a stable quantile fit needs. Below
     /// this floor the fit would come out as identity, which — once
     /// committed — would silently cost the index TQ+ for the rest of its
@@ -594,6 +608,11 @@ impl fmt::Display for CalibrateError {
                  came out as exact identity); a committed identity would \
                  report Calibrated while behaving as Uncalibrated. Pass a \
                  representative sample with real variation."
+            ),
+            Self::MappedReadOnly => write!(
+                f,
+                "the index is a mapped image and read-only; load it with \
+                 TurboQuantIndex::load to modify it"
             ),
             Self::SampleTooSmall { rows, min } => write!(
                 f,

@@ -6,7 +6,7 @@ patches open up the ability to shard one index across many machines and
 have those shards collaborate on a query — the pieces turbovec needs to
 scale horizontally without changing what it computes. Both patches exist
 for that collaboration; neither alters single-index behavior when unused.
-The `turbovec-pipestream-s17` branch carries them rebased onto
+The `turbovec-pipestream-s18` branch carries them rebased onto
 upstream `main` (`scripts/sync-upstream.sh`); each sync publishes a
 new `-sN` branch because the rebase rewrites history, and
 [turbovec-search](https://github.com/ai-pipestream/turbovec-search) is
@@ -51,6 +51,26 @@ is the collector for a coordinator that owns k itself and relays the
 merged k-th best back as the floor while several shards scan in
 tandem.
 
+**Mapped serving of v7 images.** `TurboQuantIndex::load_mapped` serves
+a v7 image from its file through a memory map (`turbovec/src/mapped.rs`):
+the superblock and the two commit headers are parsed at open, the block
+units stay on their pages, and each search assembles the chunks it scans
+— codes and scales gathered from the units, the commit header's pending
+redo ops applied, the stored-to-native layout transform run — into a
+bounded least-recently-used cache. Top-k over a mapped image is the
+streaming scan's chunk loop with a global heap per query and the
+batch's current k-th best seeded as the next chunk's floor, so scores
+and slots are bit for bit those of a loaded index; the `.tv` encoding
+is untouched. A mapped index is read-only (`add`, `swap_remove`,
+`calibrate`, `sync` refuse by name; `write` and `to_bytes` materialize
+the layout on request), and a v5/v6 file is refused with the same
+conversion advice `load` gives. The patch exists for a distributed
+engine whose sealed shards and segments never change after they are
+written: their images can then be served from the page cache instead
+of a heap copy the size of the file, on every node. `tests/mapped_image.rs`
+pins the equality, the read-only contract, the resident-memory gate,
+and the legacy refusal.
+
 ## How they are used together
 
 A coordinator fans a query out to N shard indexes, all calibrated
@@ -76,7 +96,7 @@ results remain byte-for-byte consistent with the original.
 | Repository | Role | Depends on |
 |---|---|---|
 | [RyanCodrai/turbovec](https://github.com/RyanCodrai/turbovec) | Upstream vector index library: 4-bit TurboQuant encoding, SIMD top-k search | — |
-| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s17` (this repo) | Patch fork carrying the patches above | upstream `main` |
+| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s18` (this repo) | Patch fork carrying the patches above | upstream `main` |
 | [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | Standalone single-node gRPC server for the upstream index, with client examples in Go, Java, Python, TypeScript, and Rust | upstream `turbovec` |
 | [ai-pipestream/turbovec-search](https://github.com/ai-pipestream/turbovec-search) | Distributed hybrid search: sharded vector + BM25 nodes, coordinator with floor sharing, write-ahead log, offline resharding | fork branch `turbovec-pipestream-s17` |
 | [ai-pipestream/grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis) | Text-analysis sidecar: sentence/token spans, term vectors, static embeddings, served over gRPC | — |
