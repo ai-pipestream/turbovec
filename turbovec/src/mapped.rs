@@ -21,10 +21,11 @@
 //! are dropped past the budget, so resident memory stays at the budget
 //! plus whatever the page cache keeps, never the image.
 //!
-//! A mapped index is read-only. The file must not change while it is
-//! mapped: the caller owns that guarantee (an image that is being
-//! synced is not a candidate), and a foreign write shows up as a CRC or
-//! scale failure at the next chunk, not as a wrong score.
+//! A mapped index is read-only. The file and its backing storage must not
+//! change while it is mapped: the caller owns that safety guarantee (an
+//! image that is being synced is not a candidate). The v7 format does not
+//! carry a checksum for every block unit, so validation cannot substitute
+//! for that immutability requirement.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -127,16 +128,17 @@ impl std::fmt::Debug for MappedImage {
 impl MappedImage {
     /// Map `path` and parse its superblock and commit headers; the block
     /// units stay on their pages until a scan needs them.
-    pub(crate) fn open(path: &Path, cache_bytes: usize) -> io::Result<Self> {
+    /// # Safety
+    ///
+    /// `path` and its backing storage must remain unchanged and untruncated
+    /// for the lifetime of the returned mapping and all of its clones.
+    pub(crate) unsafe fn open(path: &Path, cache_bytes: usize) -> io::Result<Self> {
         if !crate::io_v7::is_v7(path) {
             return Err(crate::io::legacy_format_error(path));
         }
         let file = std::fs::File::open(path)?;
-        // SAFETY: the mapping is read-only, and the image is immutable
-        // while mapped by contract (see the module docs); a concurrent
-        // writer can only make a later chunk fail its checks, never
-        // violate memory safety here, because every read is bounds
-        // checked against the mapping's length.
+        // SAFETY: the caller guarantees that the file and its backing storage
+        // remain unchanged and untruncated for the mapping's lifetime.
         let map = unsafe { memmap2::Mmap::map(&file)? };
         let src = path.display().to_string();
         let parsed: ParsedImage = parse_image(&map[..], 0, &src)?;

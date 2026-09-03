@@ -1738,7 +1738,7 @@ impl TurboQuantIndex {
         }
         let (_, n_byte_groups, _) = pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
         let block_bytes = n_byte_groups * BLOCK;
-        let mut kept: Vec<Vec<(f32, i64)>> = vec![Vec::with_capacity(k * 2); nq];
+        let mut kept: Vec<Vec<(f32, i64)>> = vec![Vec::with_capacity(effective_k); nq];
         let mut floors = vec![initial_threshold; nq];
         let mut base = 0usize;
         while base < self.n_vectors {
@@ -1764,7 +1764,7 @@ impl TurboQuantIndex {
                 dim,
                 live,
                 chunk_blocks,
-                k,
+                effective_k,
                 mask_slice,
                 kernel_floor,
             );
@@ -1787,9 +1787,9 @@ impl TurboQuantIndex {
                         .unwrap_or(std::cmp::Ordering::Equal)
                         .then_with(|| a.1.cmp(&b.1))
                 });
-                cands.truncate(k);
-                if cands.len() >= k {
-                    let kth = cands[k - 1].0;
+                cands.truncate(effective_k);
+                if cands.len() >= effective_k {
+                    let kth = cands[effective_k - 1].0;
                     if kth > floors[qi] {
                         floors[qi] = kth;
                     }
@@ -3002,18 +3002,30 @@ impl TurboQuantIndex {
     /// bit what [`Self::load`] produces from the same file. The index is
     /// read-only: `add`, `swap_remove`, `calibrate`, and `sync` refuse;
     /// `write` and `to_bytes` materialize the layout in memory first.
-    /// The file must not change while it is mapped. A v5 or v6 file is
-    /// refused with the same conversion advice as `load`.
-    pub fn load_mapped(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        Self::load_mapped_with_cache(path, mapped::DEFAULT_CHUNK_CACHE_BYTES)
+    /// A v5 or v6 file is refused with the same conversion advice as `load`.
+    ///
+    /// # Safety
+    ///
+    /// The file and the storage it names must remain unchanged and untruncated
+    /// until every clone of the returned index has been dropped. This is the
+    /// safety requirement of the underlying file-backed memory map.
+    pub unsafe fn load_mapped(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        // SAFETY: the caller accepts the identical lifetime requirement.
+        unsafe { Self::load_mapped_with_cache(path, mapped::DEFAULT_CHUNK_CACHE_BYTES) }
     }
 
     /// [`Self::load_mapped`] with an explicit chunk cache budget in bytes.
-    pub fn load_mapped_with_cache(
+    ///
+    /// # Safety
+    ///
+    /// The file and the storage it names must remain unchanged and untruncated
+    /// until every clone of the returned index has been dropped.
+    pub unsafe fn load_mapped_with_cache(
         path: impl AsRef<Path>,
         cache_bytes: usize,
     ) -> std::io::Result<Self> {
-        let image = mapped::MappedImage::open(path.as_ref(), cache_bytes)?;
+        // SAFETY: the caller accepts the mapping's lifetime requirement.
+        let image = unsafe { mapped::MappedImage::open(path.as_ref(), cache_bytes)? };
         Ok(Self::from_mapped(image))
     }
 
