@@ -1739,6 +1739,11 @@ impl TurboQuantIndex {
         let (_, n_byte_groups, _) = pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
         let block_bytes = n_byte_groups * BLOCK;
         let mut kept: Vec<Vec<(f32, i64)>> = vec![Vec::with_capacity(effective_k); nq];
+        // One buffer is reused across queries and chunks. Both inputs to the
+        // merge are already in the kernel's total order, so retaining the
+        // best k is linear in k instead of sorting up to 2k after every
+        // chunk. Large result windows are a primary serving shape.
+        let mut merge_scratch: Vec<(f32, i64)> = Vec::with_capacity(effective_k);
         let mut floors = vec![initial_threshold; nq];
         let mut base = 0usize;
         while base < self.n_vectors {
@@ -1770,26 +1775,47 @@ impl TurboQuantIndex {
             );
             let kb = scores.len() / nq;
             for qi in 0..nq {
-                for j in 0..kb {
-                    let idx = indices[qi * kb + j];
-                    if idx < 0 {
-                        continue;
+                merge_scratch.clear();
+                let mut left = 0usize;
+                let mut right = 0usize;
+                while merge_scratch.len() < effective_k {
+                    while right < kb {
+                        let at = qi * kb + right;
+                        if indices[at] >= 0 && scores[at] >= floors[qi] {
+                            break;
+                        }
+                        right += 1;
                     }
-                    let s = scores[qi * kb + j];
-                    if s < floors[qi] {
-                        continue;
+                    let prior = kept[qi].get(left).copied();
+                    let incoming = (right < kb).then(|| {
+                        let at = qi * kb + right;
+                        (scores[at], indices[at] + base as i64)
+                    });
+                    match (prior, incoming) {
+                        (Some(a), Some(b))
+                            if b.0
+                                .partial_cmp(&a.0)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then_with(|| a.1.cmp(&b.1))
+                                != std::cmp::Ordering::Greater =>
+                        {
+                            merge_scratch.push(a);
+                            left += 1;
+                        }
+                        (Some(_), Some(b)) | (None, Some(b)) => {
+                            merge_scratch.push(b);
+                            right += 1;
+                        }
+                        (Some(a), None) => {
+                            merge_scratch.push(a);
+                            left += 1;
+                        }
+                        (None, None) => break,
                     }
-                    kept[qi].push((s, idx + base as i64));
                 }
-                let cands = &mut kept[qi];
-                cands.sort_unstable_by(|a, b| {
-                    b.0.partial_cmp(&a.0)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.1.cmp(&b.1))
-                });
-                cands.truncate(effective_k);
-                if cands.len() >= effective_k {
-                    let kth = cands[effective_k - 1].0;
+                std::mem::swap(&mut kept[qi], &mut merge_scratch);
+                if kept[qi].len() >= effective_k {
+                    let kth = kept[qi][effective_k - 1].0;
                     if kth > floors[qi] {
                         floors[qi] = kth;
                     }
