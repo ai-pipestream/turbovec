@@ -4,12 +4,12 @@ This is ai-pipestream's patch fork of
 [RyanCodrai/turbovec](https://github.com/RyanCodrai/turbovec). The
 patches open up the ability to shard one index across many machines and
 have those shards collaborate on a query — the pieces turbovec needs to
-scale horizontally without changing what it computes. Both patches exist
-for that collaboration; neither alters single-index behavior when unused.
-The `turbovec-pipestream-s18` branch carries them rebased onto
+scale horizontally without changing what it computes. The patches exist
+for that collaboration; they do not alter single-index behavior when unused.
+The `turbovec-pipestream-s19` branch carries them rebased onto
 upstream `main` (`scripts/sync-upstream.sh`); each sync publishes a
 new `-sN` branch because the rebase rewrites history, and
-[turbovec-search](https://github.com/ai-pipestream/turbovec-search) is
+[protomolt-search](https://github.com/ai-pipestream/protomolt-search) is
 the distributed engine built on top.
 
 ## The patches
@@ -67,9 +67,12 @@ the layout on request), and a v5/v6 file is refused with the same
 conversion advice `load` gives. The patch exists for a distributed
 engine whose sealed shards and segments never change after they are
 written: their images can then be served from the page cache instead
-of a heap copy the size of the file, on every node. `tests/mapped_image.rs`
-pins the equality, the read-only contract, the resident-memory gate,
-and the legacy refusal.
+of a heap copy the size of the file, on every node. Because a file-backed
+mapping is only sound while its storage remains unchanged, the mapped
+constructors are `unsafe` and state that caller obligation explicitly;
+sealed generations are the intended owner. `tests/mapped_image.rs` pins
+the equality, oversized-k clamping, the read-only contract, the
+resident-memory gate, and the legacy refusal.
 
 ## How they are used together
 
@@ -96,7 +99,7 @@ results remain byte-for-byte consistent with the original.
 | Repository | Role | Depends on |
 |---|---|---|
 | [RyanCodrai/turbovec](https://github.com/RyanCodrai/turbovec) | Upstream vector index library: 4-bit TurboQuant encoding, SIMD top-k search | — |
-| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s18` (this repo) | Patch fork carrying the patches above | upstream `main` |
+| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s19` (this repo) | Patch fork carrying the patches above | upstream `main` |
 | [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | Standalone single-node gRPC server for the upstream index, with client examples in Go, Java, Python, TypeScript, and Rust | upstream `turbovec` |
-| [ai-pipestream/turbovec-search](https://github.com/ai-pipestream/turbovec-search) | Distributed hybrid search: sharded vector + BM25 nodes, coordinator with floor sharing, write-ahead log, offline resharding | fork branch `turbovec-pipestream-s17` |
+| [ai-pipestream/protomolt-search](https://github.com/ai-pipestream/protomolt-search) | Distributed hybrid search: sharded vector + BM25 nodes, coordinator with floor sharing, write-ahead log, offline resharding | fork branch `turbovec-pipestream-s19` |
 | [ai-pipestream/grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis) | Text-analysis sidecar: sentence/token spans, term vectors, static embeddings, served over gRPC | — |

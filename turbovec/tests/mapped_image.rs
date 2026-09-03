@@ -65,12 +65,23 @@ fn bits(results: &SearchResults) -> Vec<(u32, i64)> {
         .collect()
 }
 
-fn assert_same_search(loaded: &TurboQuantIndex, mapped: &TurboQuantIndex, queries: &[f32], k: usize) {
+fn assert_same_search(
+    loaded: &TurboQuantIndex,
+    mapped: &TurboQuantIndex,
+    queries: &[f32],
+    k: usize,
+) {
     let a = loaded.search_with_options(queries, k, SearchOptions::new());
     let b = mapped.search_with_options(queries, k, SearchOptions::new());
     assert_eq!(a.k, b.k);
     assert_eq!(a.nq, b.nq);
     assert_eq!(bits(&a), bits(&b), "k={k}");
+}
+
+fn load_mapped(path: &std::path::Path) -> TurboQuantIndex {
+    // SAFETY: every test owns its temporary image and does not mutate or
+    // truncate it until the returned mapped index has been dropped.
+    unsafe { TurboQuantIndex::load_mapped(path) }.unwrap()
 }
 
 #[test]
@@ -81,11 +92,11 @@ fn mapped_search_equals_the_loaded_index_bit_for_bit() {
     let path = dir.join("image.tv");
     let built = build(n, DIM, 1, &path);
     let loaded = TurboQuantIndex::load(&path).unwrap();
-    let mapped = TurboQuantIndex::load_mapped(&path).unwrap();
+    let mapped = load_mapped(&path);
     assert!(mapped.is_mapped());
     assert!(!loaded.is_mapped());
     assert_eq!(mapped.len(), n);
-    assert_eq!(mapped.dim(), DIM);
+    assert_eq!(mapped.dim_opt(), Some(DIM));
     assert_eq!(mapped.tqplus_shift(), built.tqplus_shift());
     assert_eq!(mapped.tqplus_scale(), built.tqplus_scale());
     let queries = unit_vectors(3, DIM, 99);
@@ -93,6 +104,7 @@ fn mapped_search_equals_the_loaded_index_bit_for_bit() {
         assert_same_search(&loaded, &mapped, &queries, k);
         assert_same_search(&built, &mapped, &queries, k);
     }
+    assert_same_search(&loaded, &mapped, &queries[..DIM], usize::MAX);
     // One query of the batch, alone: the batch floor is a minimum
     // across queries, and pruning under it must not change any row.
     for q in 0..3 {
@@ -109,7 +121,11 @@ fn mapped_search_equals_the_loaded_index_bit_for_bit() {
     // A seeded floor: the loaded index's own k-th best, and one above it.
     let kth = a.scores_for_query(0)[9];
     for floor in [kth, kth + 1e-3] {
-        let options = || SearchOptions::new().with_mask(&mask).with_initial_threshold(floor);
+        let options = || {
+            SearchOptions::new()
+                .with_mask(&mask)
+                .with_initial_threshold(floor)
+        };
         let a = loaded.search_with_options(&queries, 10, options());
         let b = mapped.search_with_options(&queries, 10, options());
         assert_eq!(bits(&a), bits(&b), "floor {floor}");
@@ -124,7 +140,7 @@ fn mapped_streaming_equals_the_loaded_streaming_scan() {
     let path = dir.join("image.tv");
     build(n, DIM, 2, &path);
     let loaded = TurboQuantIndex::load(&path).unwrap();
-    let mapped = TurboQuantIndex::load_mapped(&path).unwrap();
+    let mapped = load_mapped(&path);
     let queries = unit_vectors(2, DIM, 7);
     let collect = |index: &TurboQuantIndex| {
         let mut out: Vec<(usize, i64, u32)> = Vec::new();
@@ -161,7 +177,7 @@ fn a_synced_file_with_pending_removal_ops_serves_mapped() {
     }
     index.sync(&path).unwrap();
     let loaded = TurboQuantIndex::load(&path).unwrap();
-    let mapped = TurboQuantIndex::load_mapped(&path).unwrap();
+    let mapped = load_mapped(&path);
     assert_eq!(loaded.len(), index.len());
     assert_eq!(mapped.len(), index.len());
     let queries = unit_vectors(2, DIM, 11);
@@ -177,7 +193,7 @@ fn a_mapped_index_is_read_only_and_says_so() {
     let dir = tempdir("readonly");
     let path = dir.join("image.tv");
     let loaded = build(100, DIM, 4, &path);
-    let mut mapped = TurboQuantIndex::load_mapped(&path).unwrap();
+    let mut mapped = load_mapped(&path);
     let sample = unit_vectors(2048, DIM, 5);
     assert_eq!(
         mapped.calibrate(&sample).unwrap_err(),
@@ -202,7 +218,7 @@ fn adding_to_a_mapped_index_panics_by_name() {
     let dir = tempdir("add");
     let path = dir.join("image.tv");
     build(100, DIM, 6, &path);
-    let mut mapped = TurboQuantIndex::load_mapped(&path).unwrap();
+    let mut mapped = load_mapped(&path);
     mapped.add(&unit_vectors(1, DIM, 8));
 }
 
@@ -212,7 +228,7 @@ fn removing_from_a_mapped_index_panics_by_name() {
     let dir = tempdir("remove");
     let path = dir.join("image.tv");
     build(100, DIM, 6, &path);
-    let mut mapped = TurboQuantIndex::load_mapped(&path).unwrap();
+    let mut mapped = load_mapped(&path);
     mapped.swap_remove(3);
 }
 
@@ -223,7 +239,9 @@ fn a_legacy_file_is_refused_with_conversion_advice() {
     build(2000, DIM, 9, &v7);
     let v6 = dir.join("image-v6.tv");
     turbovec::convert::convert_file(&v7, &v6, turbovec::convert::Version::V6).unwrap();
-    let error = TurboQuantIndex::load_mapped(&v6).unwrap_err();
+    // SAFETY: the test owns the immutable temporary image. The call is
+    // expected to reject its version before returning a mapping.
+    let error = unsafe { TurboQuantIndex::load_mapped(&v6) }.unwrap_err();
     let message = error.to_string();
     assert!(message.contains("version 6"), "{message}");
     assert!(message.contains("convert"), "{message}");
@@ -232,7 +250,7 @@ fn a_legacy_file_is_refused_with_conversion_advice() {
     let back = dir.join("image-back.tv");
     turbovec::convert::convert_file(&v6, &back, turbovec::convert::Version::V7).unwrap();
     let loaded = TurboQuantIndex::load(&v7).unwrap();
-    let mapped = TurboQuantIndex::load_mapped(&back).unwrap();
+    let mapped = load_mapped(&back);
     assert_same_search(&loaded, &mapped, &unit_vectors(1, DIM, 10), 20);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -261,10 +279,13 @@ fn mapped_open_keeps_resident_memory_far_below_a_load() {
         index.write(&path).unwrap();
     }
     let image_bytes = std::fs::metadata(&path).unwrap().len() as usize;
-    assert!(image_bytes > 16 * 1024 * 1024, "image is {image_bytes} bytes");
+    assert!(
+        image_bytes > 16 * 1024 * 1024,
+        "image is {image_bytes} bytes"
+    );
 
     let before = rss_bytes();
-    let mapped = TurboQuantIndex::load_mapped(&path).unwrap();
+    let mapped = load_mapped(&path);
     let after_map = rss_bytes();
     let mapped_growth = after_map.saturating_sub(before);
     assert!(
