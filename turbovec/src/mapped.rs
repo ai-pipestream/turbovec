@@ -213,7 +213,7 @@ impl MappedImage {
     /// Gather the blocks' code bytes and scales from their units (and
     /// the header tail for the last, partial block), apply the pending
     /// redo ops, and transform into the kernel's native layout.
-    fn assemble(&self, base: usize, live: usize) -> io::Result<Chunk> {
+    pub(crate) fn assemble(&self, base: usize, live: usize) -> io::Result<Chunk> {
         let row_bytes = self.geo.row_bytes();
         let block_bytes = BLOCK * row_bytes;
         let first_block = base / BLOCK;
