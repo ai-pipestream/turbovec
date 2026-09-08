@@ -3406,9 +3406,10 @@ impl TurboQuantIndex {
     /// Where [`Self::packed_codes`] converts and retains the whole image on a
     /// loaded or mapped index, this converts one 32-row block at a time from
     /// whichever layout the index already holds — the packed rows when they
-    /// exist, else the blocked cache, else the mapped image's chunks (the
-    /// same cached chunks a search reads) — so the memory it touches is the
-    /// caller's range plus one block, independent of the image's size, and
+    /// exist, else the blocked cache, else one block assembled from the
+    /// mapped pages outside the search's chunk cache — so the memory it
+    /// touches is the caller's range plus one block, independent of the
+    /// image's size, it evicts nothing a query holds, and
     /// [`Self::packed_ready`] is unchanged by the call. A caller comparing two
     /// images row by row (a rewrite proof) uses this in bounded pieces.
     pub fn stored_rows(
@@ -3447,18 +3448,17 @@ impl TurboQuantIndex {
             let block_rows = BLOCK.min(self.n_vectors - block * BLOCK);
             let seq = match (self.mapped.as_ref(), self.blocked.get()) {
                 (Some(mapped), _) => {
-                    // The chunk a streaming search would read for this block,
-                    // so the mapped image's cache serves both.
-                    let base = block * BLOCK / STREAM_CHUNK_ROWS * STREAM_CHUNK_ROWS;
-                    let live = STREAM_CHUNK_ROWS.min(self.n_vectors - base);
+                    // One block assembled straight from the mapped pages,
+                    // outside the search's chunk cache: the copy lives for
+                    // this iteration and evicts nothing a query holds.
+                    let base = block * BLOCK;
                     let chunk = mapped
-                        .chunk(base, live)
+                        .assemble(base, block_rows)
                         .map_err(|_| StoredRowsError::NoRepresentation)?;
-                    let at = (block - base / BLOCK) * block_bytes;
-                    let lo = rows.start.max(block * BLOCK) - base;
-                    let hi = rows.end.min(block * BLOCK + block_rows) - base;
+                    let lo = rows.start.max(base) - base;
+                    let hi = rows.end.min(base + block_rows) - base;
                     scales.extend_from_slice(&chunk.scales[lo..hi]);
-                    pack::native_to_seq(&chunk.codes[at..at + block_bytes], bits, n_byte_groups)
+                    pack::native_to_seq(&chunk.codes[..block_bytes], bits, n_byte_groups)
                 }
                 (None, Some(cache)) => {
                     let at = block * block_bytes;
