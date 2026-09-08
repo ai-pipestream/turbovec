@@ -80,7 +80,9 @@ pub mod warning;
 #[cfg(test)]
 mod kernel_tests;
 
-pub use error::{AddError, CalibrateError, ConstructError, FromPartsError, SearchError};
+pub use error::{
+    AddError, CalibrateError, ConstructError, FromPartsError, SearchError, StoredRowsError,
+};
 pub use id_map::{IdMapIndex, IdSearchResults};
 pub use warning::{set_warning_hook, WarningHook};
 
@@ -3395,6 +3397,87 @@ impl TurboQuantIndex {
         self.packed()
     }
 
+    /// The stored encoding of rows `rows`, copied out without materializing
+    /// the image: `codes` receives the bit-plane packed codes row-major at
+    /// `bit_width * dim / 8` bytes a row, exactly the bytes [`Self::packed_codes`]
+    /// holds for those rows, and `scales` the per-vector correction scales.
+    /// Both vectors are cleared first.
+    ///
+    /// Where [`Self::packed_codes`] converts and retains the whole image on a
+    /// loaded or mapped index, this converts one 32-row block at a time from
+    /// whichever layout the index already holds — the packed rows when they
+    /// exist, else the blocked cache, else the mapped image's chunks (the
+    /// same cached chunks a search reads) — so the memory it touches is the
+    /// caller's range plus one block, independent of the image's size, and
+    /// [`Self::packed_ready`] is unchanged by the call. A caller comparing two
+    /// images row by row (a rewrite proof) uses this in bounded pieces.
+    pub fn stored_rows(
+        &self,
+        rows: std::ops::Range<usize>,
+        codes: &mut Vec<u8>,
+        scales: &mut Vec<f32>,
+    ) -> Result<(), StoredRowsError> {
+        codes.clear();
+        scales.clear();
+        if rows.end > self.n_vectors || rows.start > rows.end {
+            return Err(StoredRowsError::RangeOutOfBounds {
+                end: rows.end,
+                n_vectors: self.n_vectors,
+            });
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let Some(dim) = self.dim else {
+            return Err(StoredRowsError::NoRepresentation);
+        };
+        let bits = self.bit_width;
+        let bytes_per_row = bits * dim / 8;
+        if let (Some(packed), None) = (self.packed_codes.get(), self.mapped.as_ref()) {
+            codes.extend_from_slice(&packed[rows.start * bytes_per_row..rows.end * bytes_per_row]);
+            scales.extend_from_slice(&self.scales[rows.clone()]);
+            return Ok(());
+        }
+        let (_, n_byte_groups, _) = pack::blocked_geometry(self.n_vectors, bits, dim);
+        let block_bytes = n_byte_groups * BLOCK;
+        codes.reserve(rows.len() * bytes_per_row);
+        scales.reserve(rows.len());
+        let mut block = rows.start / BLOCK;
+        while block * BLOCK < rows.end {
+            let block_rows = BLOCK.min(self.n_vectors - block * BLOCK);
+            let seq = match (self.mapped.as_ref(), self.blocked.get()) {
+                (Some(mapped), _) => {
+                    // The chunk a streaming search would read for this block,
+                    // so the mapped image's cache serves both.
+                    let base = block * BLOCK / STREAM_CHUNK_ROWS * STREAM_CHUNK_ROWS;
+                    let live = STREAM_CHUNK_ROWS.min(self.n_vectors - base);
+                    let chunk = mapped
+                        .chunk(base, live)
+                        .map_err(|_| StoredRowsError::NoRepresentation)?;
+                    let at = (block - base / BLOCK) * block_bytes;
+                    let lo = rows.start.max(block * BLOCK) - base;
+                    let hi = rows.end.min(block * BLOCK + block_rows) - base;
+                    scales.extend_from_slice(&chunk.scales[lo..hi]);
+                    pack::native_to_seq(&chunk.codes[at..at + block_bytes], bits, n_byte_groups)
+                }
+                (None, Some(cache)) => {
+                    let at = block * block_bytes;
+                    let lo = rows.start.max(block * BLOCK);
+                    let hi = rows.end.min(block * BLOCK + block_rows);
+                    scales.extend_from_slice(&self.scales[lo..hi]);
+                    pack::native_to_seq(&cache.data[at..at + block_bytes], bits, n_byte_groups)
+                }
+                (None, None) => return Err(StoredRowsError::NoRepresentation),
+            };
+            let packed = pack::seq_to_packed(&seq, block_rows, bits, dim);
+            let lo = rows.start.max(block * BLOCK) - block * BLOCK;
+            let hi = rows.end.min(block * BLOCK + block_rows) - block * BLOCK;
+            codes.extend_from_slice(&packed[lo * bytes_per_row..hi * bytes_per_row]);
+            block += 1;
+        }
+        Ok(())
+    }
+
     /// Per-vector correction scales. Pairs with [`Self::from_parts`].
     pub fn scales(&self) -> &[f32] {
         self.scales_any()
@@ -5558,5 +5641,118 @@ mod v7_delta_tests {
             TurboQuantIndex::load(&path2).unwrap().to_bytes(),
             rec.to_bytes()
         );
+    }
+}
+
+#[cfg(test)]
+mod stored_rows_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
+        let mut out = vec![0.0f32; n * dim];
+        for x in out.iter_mut() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *x = ((s >> 33) as f64 / (1u64 << 31) as f64 - 1.0) as f32;
+        }
+        out
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("turbovec-stored-rows-{nonce}-{name}"));
+        std::fs::create_dir(&p).unwrap();
+        p.push("index.tv");
+        p
+    }
+
+    /// Every range of every layout equals the packed image's slice, and
+    /// reading through the loaded and mapped forms leaves the packed rows
+    /// (and the mapped blocked cache) unmaterialized.
+    #[test]
+    fn stored_rows_match_packed_codes_without_materializing() {
+        // (bits, dim) chosen so each native layout is exercised: vm8, the
+        // 4-group vector-major unit, and the x86 perm0 interleave.
+        for (bits, dim, n) in [
+            (4usize, 64usize, 1000usize),
+            (3, 64, 333),
+            (2, 8, 77),
+            (4, 32, 32),
+        ] {
+            let mut built = TurboQuantIndex::new(dim, bits).unwrap();
+            built.add(&rows(n, dim, 7));
+            built.prepare();
+            let expected_codes = built.packed_codes().to_vec();
+            let expected_scales = built.scales().to_vec();
+            let bytes_per_row = bits * dim / 8;
+            assert_eq!(expected_codes.len(), n * bytes_per_row);
+
+            let path = temp(&format!("{bits}-{dim}"));
+            built.write(&path).unwrap();
+            let loaded = TurboQuantIndex::load(&path).unwrap();
+            // SAFETY: the file is private to this test and stays unchanged.
+            let mapped = unsafe { TurboQuantIndex::load_mapped(&path) }.unwrap();
+            assert!(!loaded.packed_ready());
+            assert!(!mapped.packed_ready());
+
+            let mut codes = Vec::new();
+            let mut scales = Vec::new();
+            let ranges = [
+                0..n,
+                0..1,
+                n - 1..n,
+                5..37,
+                31..33,
+                (n / 2)..(n / 2 + BLOCK + 3),
+                n.saturating_sub(BLOCK + 1)..n,
+                10..10,
+            ];
+            for index in [&built, &loaded, &mapped] {
+                for range in &ranges {
+                    let range = range.start.min(n)..range.end.min(n);
+                    index
+                        .stored_rows(range.clone(), &mut codes, &mut scales)
+                        .unwrap();
+                    assert_eq!(
+                        codes,
+                        &expected_codes[range.start * bytes_per_row..range.end * bytes_per_row],
+                        "bits={bits} dim={dim} range={range:?}"
+                    );
+                    assert_eq!(
+                        scales,
+                        &expected_scales[range.clone()],
+                        "bits={bits} dim={dim}"
+                    );
+                }
+                assert!(matches!(
+                    index.stored_rows(0..n + 1, &mut codes, &mut scales),
+                    Err(StoredRowsError::RangeOutOfBounds { .. })
+                ));
+            }
+            assert!(
+                !loaded.packed_ready(),
+                "reading rows must not materialize the packed image"
+            );
+            assert!(
+                !mapped.packed_ready(),
+                "reading rows must not materialize the packed image"
+            );
+            assert!(
+                mapped.blocked.get().is_none(),
+                "reading rows must not materialize the mapped blocked cache"
+            );
+            assert!(
+                mapped.mapped_scales.get().is_none(),
+                "reading rows must not materialize the mapped scales"
+            );
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
     }
 }
