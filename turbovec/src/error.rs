@@ -648,3 +648,38 @@ impl fmt::Display for CalibrateError {
 }
 
 impl Error for CalibrateError {}
+
+/// Why [`TurboQuantIndex::stored_rows`](crate::TurboQuantIndex::stored_rows)
+/// could not copy a row range out of the index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredRowsError {
+    /// The range reaches past the stored vectors.
+    RangeOutOfBounds {
+        /// The requested range's end (exclusive).
+        end: usize,
+        /// Vectors the index holds.
+        n_vectors: usize,
+    },
+    /// The index holds vectors but no readable code layout: neither the
+    /// packed rows nor a blocked or mapped image. Reaching this means a
+    /// mutation invalidated one layout before the other existed.
+    NoRepresentation,
+}
+
+impl fmt::Display for StoredRowsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RangeOutOfBounds { end, n_vectors } => {
+                write!(
+                    f,
+                    "row range ends at {end} but the index holds {n_vectors} vectors"
+                )
+            }
+            Self::NoRepresentation => {
+                write!(f, "index holds vectors but no readable code layout")
+            }
+        }
+    }
+}
+
+impl Error for StoredRowsError {}
