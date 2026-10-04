@@ -67,6 +67,7 @@ pub mod id_map;
 pub mod convert;
 pub mod io;
 mod io_v7;
+mod mapped;
 pub mod pack;
 pub mod rotation;
 pub mod search;
@@ -78,8 +79,14 @@ pub mod warning;
 // of the public surface); the coverage is unchanged.
 #[cfg(test)]
 mod kernel_tests;
+#[cfg(test)]
+mod planes_tests;
+#[cfg(test)]
+mod planes_fork_tests;
 
-pub use error::{AddError, CalibrateError, ConstructError, FromPartsError, SearchError};
+pub use error::{
+    AddError, CalibrateError, ConstructError, FromPartsError, SearchError, StoredRowsError,
+};
 pub use id_map::{IdMapIndex, IdSearchResults};
 pub use warning::{set_warning_hook, WarningHook};
 
@@ -253,6 +260,59 @@ pub fn validation_parallelizes(len: usize) -> bool {
 struct BlockedCache {
     data: Vec<u8>,
     n_blocks: usize,
+    /// H99: under `pack::planes_for`, `data` is the sign region and this is
+    /// the low region (one row per vector). Empty otherwise.
+    low: Vec<u8>,
+    /// H99: the sampled outer-level fraction of a planes cache (see
+    /// `pack::planes_outer_frac`), computed on first search.
+    outer_frac: OnceLock<f32>,
+    /// H99: `pack::planes_sample` of this cache, built on first search and
+    /// dropped by every mutation.
+    sample: OnceLock<Option<(Vec<u8>, Vec<f32>)>>,
+}
+
+impl BlockedCache {
+    /// Build the search cache for `n_vectors` packed rows in whichever
+    /// layout this geometry searches.
+    fn build(packed: &[u8], n_vectors: usize, bits: usize, dim: usize) -> Self {
+        if pack::planes_wanted(bits, dim / (8 / bits), n_vectors) {
+            let (data, low, n_blocks) = pack::planes_repack(packed, n_vectors, dim);
+            return Self { data, low, n_blocks, outer_frac: OnceLock::new(), sample: OnceLock::new() };
+        }
+        let (data, n_blocks) = pack::repack(packed, n_vectors, bits, dim);
+        Self { data, low: Vec::new(), n_blocks, outer_frac: OnceLock::new(), sample: OnceLock::new() }
+    }
+
+    /// Whether this cache is in the planes layout (`data` the sign region,
+    /// `low` the low region). An index takes it at `planes_min_vectors`
+    /// and keeps it if it later shrinks; the low region is non-empty
+    /// exactly when it is in use.
+    fn is_planes(&self) -> bool {
+        !self.low.is_empty()
+    }
+
+    /// Convert a classic cache to the planes layout once the index is
+    /// large enough for it. One O(n) pass, at the size threshold only.
+    fn promote_if_due(&mut self, n_vectors: usize, bits: usize, nbg: usize) {
+        if self.is_planes() || !pack::planes_wanted(bits, nbg, n_vectors) {
+            return;
+        }
+        let seq = pack::native_to_seq(&self.data, bits, nbg);
+        let (data, low) = pack::planes_from_seq(&seq, nbg, n_vectors);
+        self.data = data;
+        self.low = low;
+        self.sample = OnceLock::new();
+        self.outer_frac = OnceLock::new();
+    }
+
+    /// The cache's rows as sequential-blocked code bytes (the stored form).
+    fn to_seq(&self, n_vectors: usize, bits: usize, nbg: usize) -> Vec<u8> {
+        if self.is_planes() {
+            pack::planes_to_seq(&self.data, &self.low, nbg, n_vectors)
+        } else {
+            pack::native_to_seq(&self.data, bits, nbg)
+        }
+    }
 }
 
 /// Whether an index has a TQ+ per-coordinate calibration.
@@ -361,6 +421,16 @@ pub struct TurboQuantIndex {
     /// the retention target in [`retain_scratch`], so a buffer is only
     /// kept while the adds around it are still using one that big.
     encode_scratch_prev: usize,
+    /// The file this index serves from, when it was opened with
+    /// [`Self::load_mapped`]: the search cache is assembled chunk by
+    /// chunk from the mapped pages and the index takes no mutation.
+    /// `blocked` stays empty until a read that needs the whole layout
+    /// (`write`, `to_bytes`, `packed_codes`) materializes it.
+    mapped: Option<std::sync::Arc<mapped::MappedImage>>,
+    /// A mapped index's scales, materialized with its blocked layout
+    /// on the first read that needs the whole image; empty otherwise
+    /// (`scales` is unused for a mapped index, its chunks carry theirs).
+    mapped_scales: OnceLock<Vec<f32>>,
     /// Cursor into the last-synced v7 file, when this index has one:
     /// the commit the file holds, so `sync` writes only the delta.
     sync_cursor: Option<io_v7::SyncCursor>,
@@ -492,7 +562,8 @@ pub(crate) fn reserve_mostly_exact<T>(v: &mut Vec<T>, additional: usize) {
 }
 
 /// Top-`k` results for a batch of queries, as returned by
-/// [`TurboQuantIndex::search`] / [`TurboQuantIndex::search_with_mask`].
+/// [`TurboQuantIndex::search`] / [`TurboQuantIndex::search_with_mask`] /
+/// [`TurboQuantIndex::search_with_options`].
 ///
 /// `scores` and `indices` are flattened row-major with one row per
 /// query: row `qi` occupies indices `qi * k .. (qi + 1) * k` in both,
@@ -509,6 +580,12 @@ pub(crate) fn reserve_mostly_exact<T>(v: &mut Vec<T>, additional: usize) {
 /// patterns. Good enough for `assert_eq!` on results the index actually
 /// returns; not a substitute for comparing scores within a tolerance,
 /// and not enough to key a map.
+///
+/// When a search ran with [`SearchOptions::initial_threshold`], a query
+/// row whose floor excluded candidates holds fewer than `k` real
+/// results; the tail of such a row is padded with sentinel entries
+/// (`score == f32::NEG_INFINITY`, `index == -1`). Searches without a
+/// floor never produce padding.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResults {
     /// Scores, row-major `nq × k`, sorted descending within each row
@@ -549,13 +626,130 @@ impl SearchResults {
     }
 }
 
+/// Options for [`TurboQuantIndex::search_with_options`].
+///
+/// `#[non_exhaustive]` so future options are not a breaking change:
+/// construct with [`SearchOptions::new`] / [`Default`] and refine with the
+/// builder-style `with_*` methods.
+#[derive(Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct SearchOptions<'a> {
+    /// Per-slot allow mask; same semantics and panics as
+    /// [`TurboQuantIndex::search_with_mask`]. `None` searches every slot.
+    pub mask: Option<&'a [bool]>,
+
+    /// Initial top-k threshold (a score floor). When `Some(f)`, the
+    /// search collects only candidates scoring `>= f`, exactly as if `k`
+    /// results at score `f` had already been observed: the pruning
+    /// cutoff starts at the floor instead of only rising once the local
+    /// top-k fills, so callers that already hold scored candidates (a
+    /// previous result set being re-queried after appends, the running
+    /// merged k-th best while searching several indexes, a cheap first
+    /// pass in a cascade) skip work the scan would otherwise redo.
+    ///
+    /// For any `f` that is a true lower bound on the final k-th best
+    /// score, results are identical to an unseeded search. For a higher
+    /// `f`, the result set is the unseeded result set filtered to
+    /// scores `>= f`; ties exactly at the floor survive. A query row
+    /// whose floor excludes candidates holds fewer than `k` real
+    /// results and is padded — see [`SearchResults`].
+    ///
+    /// `None` and `Some(f32::NEG_INFINITY)` are equivalent (no floor).
+    pub initial_threshold: Option<f32>,
+}
+
+impl<'a> SearchOptions<'a> {
+    /// Default options: no mask, no floor — equivalent to
+    /// [`TurboQuantIndex::search`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Restrict the search to slots whose `mask` entry is `true`.
+    pub fn with_mask(mut self, mask: &'a [bool]) -> Self {
+        self.mask = Some(mask);
+        self
+    }
+
+    /// Seed the top-k cutoff with a score floor. See
+    /// [`SearchOptions::initial_threshold`].
+    pub fn with_initial_threshold(mut self, floor: f32) -> Self {
+        self.initial_threshold = Some(floor);
+        self
+    }
+}
+
+/// One emission from [`TurboQuantIndex::search_streaming`]: every
+/// candidate in one emission chunk, for one query, scoring at or above
+/// that query's current floor.
+///
+/// `scores` are descending; `slots` are global slot indices (the same
+/// values a [`SearchResults`] row would hold). The two slices always
+/// have the same non-zero length: empty batches are never emitted.
+#[derive(Clone, Copy, Debug)]
+pub struct StreamBatch<'a> {
+    /// Which query row (of the `nq` in the call) this batch belongs to.
+    pub query_index: usize,
+    /// First slot of the emission chunk these candidates came from.
+    /// Strictly increasing across the batches of one query.
+    pub block_base: usize,
+    /// Candidate scores, descending.
+    pub scores: &'a [f32],
+    /// Global slot indices, parallel to `scores`.
+    pub slots: &'a [i64],
+}
+
+/// Sink verdict after each [`StreamBatch`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StreamControl {
+    /// Keep scanning.
+    Continue,
+    /// Keep scanning, and raise the batch's query's floor to this value
+    /// starting with the next chunk. Values at or below the current
+    /// floor are ignored: floors only rise, because earlier chunks were
+    /// already emitted under the old floor and cannot be revisited.
+    /// Must not be NaN.
+    RaiseFloor(f32),
+    /// Abandon the whole call. Everything emitted so far stands, but
+    /// the returned summary has `completed: false`: unscanned chunks
+    /// may hold candidates above every floor.
+    Stop,
+}
+
+/// What a [`TurboQuantIndex::search_streaming`] call did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamSummary {
+    /// Number of query rows in the call.
+    pub nq: usize,
+    /// Total candidates emitted across every batch and query.
+    pub emitted: usize,
+    /// Emission chunks scored (each chunk is scored once for all
+    /// queries together, so this does not scale with `nq`).
+    pub blocks_scanned: usize,
+    /// `true` when every chunk was scanned to the end: for each query,
+    /// every live slot scoring at or above that query's floor (as it
+    /// stood when the slot's chunk was scored) was emitted. This is the
+    /// exactness certificate a caller merging several indexes waits
+    /// for. `false` means the sink stopped the scan and the emissions
+    /// are a prefix, not a certificate.
+    pub completed: bool,
+}
+
+/// Rows per emission chunk of [`TurboQuantIndex::search_streaming`]:
+/// the cadence at which the sink is consulted and floor raises bind.
+/// A multiple of 64 (whole mask words, so chunk bases fall on word
+/// boundaries) and of the SIMD block rows. 8192 preserves the batch
+/// cadence the calibration-block fork chain had, so nothing built on
+/// the batch rhythm re-tunes.
+const STREAM_CHUNK_ROWS: usize = 8192;
+
 impl TurboQuantIndex {
     /// The packed bit-plane codes, materializing them from the blocked
     /// cache if this index was v6-loaded and hasn't needed them yet.
     /// O(n·dim) on that first materialization, O(1) afterwards.
     fn packed(&self) -> &Vec<u8> {
         self.packed_codes.get_or_init(|| {
-            let (Some(dim), Some(cache)) = (self.dim, self.blocked.get()) else {
+            let (Some(dim), Some(cache)) = (self.dim, self.blocked_any()) else {
                 // Reaching here with vectors would mean a mutation
                 // invalidated `blocked` before materializing packed —
                 // an ordering bug that would silently wipe the codes.
@@ -569,7 +763,7 @@ impl TurboQuantIndex {
                 return Vec::new();
             }
             let (_, nbg, _) = pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
-            let seq = pack::native_to_seq(&cache.data, self.bit_width, nbg);
+            let seq = cache.to_seq(self.n_vectors, self.bit_width, nbg);
             pack::seq_to_packed(&seq, self.n_vectors, self.bit_width, dim)
         })
     }
@@ -651,6 +845,8 @@ impl TurboQuantIndex {
             blocked: OnceLock::new(),
             encode_scratch: Vec::new(),
             encode_scratch_prev: 0,
+            mapped: None,
+            mapped_scales: OnceLock::new(),
             sync_cursor: None,
             sync_path: None,
             sync_pending: std::collections::HashSet::new(),
@@ -685,6 +881,8 @@ impl TurboQuantIndex {
             blocked: OnceLock::new(),
             encode_scratch: Vec::new(),
             encode_scratch_prev: 0,
+            mapped: None,
+            mapped_scales: OnceLock::new(),
             sync_cursor: None,
             sync_path: None,
             sync_pending: std::collections::HashSet::new(),
@@ -821,6 +1019,11 @@ impl TurboQuantIndex {
     /// committing) a fresh one otherwise. Assumes the caller has already
     /// validated `vectors` and resolved `dim`.
     fn encode_and_append(&mut self, vectors: &[f32], n: usize, dim: usize) {
+        assert!(
+            self.mapped.is_none(),
+            "the index is a mapped image and read-only; load it with TurboQuantIndex::load to \
+             modify it"
+        );
         // Rows land at slots [n_vectors, n_vectors + n), and none of them
         // can carry a capture. A capture is only taken for a slot below
         // n_vectors, and n_vectors only ever falls through `swap_remove`,
@@ -963,7 +1166,15 @@ impl TurboQuantIndex {
                 .blocked
                 .get_mut()
                 .expect("lazy_append requires a blocked cache");
-            pack::append_lanes(&mut cache.data, &packed_codes, old_n, n, bit_width, dim);
+            cache.sample = OnceLock::new();
+            if cache.is_planes() {
+                pack::planes_append_lanes(
+                    &mut cache.data, &mut cache.low, &packed_codes, old_n, n, dim,
+                );
+            } else {
+                pack::append_lanes(&mut cache.data, &packed_codes, old_n, n, bit_width, dim);
+                cache.promote_if_due(new_n, bit_width, dim / (8 / bit_width));
+            }
             let (new_n_blocks, _, _) = pack::blocked_geometry(new_n, bit_width, dim);
             cache.n_blocks = new_n_blocks;
             self.scales = scales_buf;
@@ -1005,7 +1216,7 @@ impl TurboQuantIndex {
                 if FORCE_REPACK_PANIC.with(|f| f.replace(false)) {
                     panic!("forced repack panic (test)");
                 }
-                pack::repack(&packed_codes, new_n, bit_width, dim)
+                BlockedCache::build(&packed_codes, new_n, bit_width, dim)
             })) {
                 Ok(built) => built,
                 Err(panic) => {
@@ -1016,8 +1227,7 @@ impl TurboQuantIndex {
                     std::panic::resume_unwind(panic);
                 }
             };
-            let (data, n_blocks) = built;
-            let _ = self.blocked.set(BlockedCache { data, n_blocks });
+            let _ = self.blocked.set(built);
         } else {
             let (new_n_blocks, n_byte_groups, _) =
                 pack::blocked_geometry(new_n, self.bit_width, dim);
@@ -1035,19 +1245,29 @@ impl TurboQuantIndex {
             // and resume, the same contract `encode`'s guard above keeps
             // (#388).
             let bit_width = self.bit_width;
+            let was_planes = self.blocked.get().is_some_and(|c| c.is_planes());
             let patch = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 #[cfg(test)]
                 if FORCE_REPACK_PANIC.with(|f| f.replace(false)) {
                     panic!("forced repack panic (test)");
                 }
-                pack::repack_block_range(
-                    &packed_codes,
-                    new_n,
-                    bit_width,
-                    dim,
-                    first_block,
-                    new_n_blocks,
-                )
+                if was_planes {
+                    pack::planes_repack_block_range(
+                        &packed_codes, new_n, dim, first_block, new_n_blocks,
+                    )
+                } else {
+                    (
+                        pack::repack_block_range(
+                            &packed_codes,
+                            new_n,
+                            bit_width,
+                            dim,
+                            first_block,
+                            new_n_blocks,
+                        ),
+                        Vec::new(),
+                    )
+                }
             })) {
                 Ok(patch) => patch,
                 Err(panic) => {
@@ -1059,11 +1279,25 @@ impl TurboQuantIndex {
                 }
             };
             let cache = self.blocked.get_mut().expect("blocked present");
+            cache.sample = OnceLock::new();
+            let (patch, low_patch) = patch;
+            // Under the planes layout `data` is the sign region, whose
+            // blocks are half as wide, and the low region is one row per
+            // vector; both are rebuilt from `first_block` on.
+            let planes = was_planes;
+            let block_bytes = if planes { block_bytes / 2 } else { block_bytes };
             cache.data.truncate(first_block * block_bytes);
             // `extend_from_slice` reserves amortized, doubling the cache
             // for a one-block patch on a tight buffer (#501).
             reserve_mostly_exact(&mut cache.data, patch.len());
             cache.data.extend_from_slice(&patch);
+            if planes {
+                cache.low.truncate(first_block * BLOCK * (n_byte_groups / 2));
+                reserve_mostly_exact(&mut cache.low, low_patch.len());
+                cache.low.extend_from_slice(&low_patch);
+            } else {
+                cache.promote_if_due(new_n, bit_width, n_byte_groups);
+            }
             cache.n_blocks = new_n_blocks;
         }
         // Commit point: every fallible step above has succeeded.
@@ -1348,6 +1582,52 @@ impl TurboQuantIndex {
         k: usize,
         mask: Option<&[bool]>,
     ) -> Result<SearchResults, SearchError> {
+        let mut options = SearchOptions::new();
+        options.mask = mask;
+        self.try_search_with_options(queries, k, options)
+    }
+
+    /// Run a top-`k` search with [`SearchOptions`]: an optional slot mask
+    /// and an optional initial top-k threshold (score floor).
+    ///
+    /// With default options this is [`Self::search`]; with only a mask it
+    /// is [`Self::search_with_mask`]. See
+    /// [`SearchOptions::initial_threshold`] for the floor semantics —
+    /// with a floor set, query rows may contain fewer than `k` real
+    /// results and are padded with `(f32::NEG_INFINITY, -1)` entries
+    /// (see [`SearchResults`]).
+    ///
+    /// # Panics
+    ///
+    /// - If `options.initial_threshold` is NaN.
+    /// - Plus the same panics as [`Self::search_with_mask`].
+    pub fn search_with_options(
+        &self,
+        queries: &[f32],
+        k: usize,
+        options: SearchOptions<'_>,
+    ) -> SearchResults {
+        self.try_search_with_options(queries, k, options)
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// [`Self::search_with_options`] as a `Result`: the non-panicking
+    /// form, with the same validation as [`Self::try_search_with_mask`]
+    /// (it is the single implementation both mask entry points delegate
+    /// to). The NaN check on `initial_threshold` stays an assert in both
+    /// forms: it is API misuse, not input data.
+    pub fn try_search_with_options(
+        &self,
+        queries: &[f32],
+        k: usize,
+        options: SearchOptions<'_>,
+    ) -> Result<SearchResults, SearchError> {
+        let mask = options.mask;
+        let initial_threshold = options.initial_threshold.unwrap_or(f32::NEG_INFINITY);
+        assert!(
+            !initial_threshold.is_nan(),
+            "initial_threshold must not be NaN",
+        );
         // A lazy index that's never seen an add returns an empty result
         // shaped according to the caller's query count (best effort: we
         // don't know dim, so nq is 0). Matches Python users' expectation
@@ -1400,6 +1680,9 @@ impl TurboQuantIndex {
                 k: 0,
             });
         }
+        if let Some(mapped) = &self.mapped {
+            return self.search_mapped(mapped, queries, nq, dim, k, mask, initial_threshold);
+        }
 
         let rotation = self
             .rotation
@@ -1409,9 +1692,7 @@ impl TurboQuantIndex {
             c
         });
         let blocked = self.blocked.get_or_init(|| {
-            let (data, n_blocks) =
-                pack::repack(self.packed(), self.n_vectors, self.bit_width, dim);
-            BlockedCache { data, n_blocks }
+            BlockedCache::build(self.packed(), self.n_vectors, self.bit_width, dim)
         });
 
         // A wrong-length mask is caller data, so it leaves through the
@@ -1459,6 +1740,23 @@ impl TurboQuantIndex {
         let packed_mask = packed_mask.map(|p| p.0);
         let effective_k = k.min(self.n_vectors).min(n_allowed);
 
+        // H99: a planes cache is searched sign plane first.
+        let planes = if blocked.is_planes() {
+            let outer = *blocked.outer_frac.get_or_init(|| {
+                pack::planes_outer_frac(&blocked.data, &blocked.low, self.n_vectors, dim / 4)
+            });
+            let sample = blocked.sample.get_or_init(|| {
+                pack::planes_sample(&blocked.data, &self.scales, self.n_vectors, dim / 4)
+            });
+            Some(search::PlanesRef {
+                low: &blocked.low,
+                outer_frac: outer,
+                sample: sample.as_ref().map(|(c, s)| (c.as_slice(), s.as_slice())),
+            })
+        } else {
+            None
+        };
+
         let (scores, indices) = search::search(
             queries,
             nq,
@@ -1474,6 +1772,8 @@ impl TurboQuantIndex {
             blocked.n_blocks,
             k,
             packed_mask.as_deref(),
+            planes,
+            initial_threshold,
         );
 
         Ok(SearchResults {
@@ -1483,6 +1783,605 @@ impl TurboQuantIndex {
             k: effective_k,
         })
     }
+
+    /// Top-k over a mapped image: the chunk loop of the streaming scan
+    /// with a global heap per query. Each chunk goes through the kernel
+    /// with `k` and the query batch's current k-th-best as the floor
+    /// (a true lower bound, so pruning is exact and ties at the floor
+    /// survive), and the union of the chunks' top-k is the top-k of
+    /// the whole image, ordered by the kernel's rule: score descending,
+    /// then slot ascending. Scores are the kernel's own, bit for bit.
+    #[allow(clippy::too_many_arguments)]
+    fn search_mapped(
+        &self,
+        mapped: &mapped::MappedImage,
+        queries: &[f32],
+        nq: usize,
+        dim: usize,
+        k: usize,
+        mask: Option<&[bool]>,
+        initial_threshold: f32,
+    ) -> Result<SearchResults, SearchError> {
+        if let Some(m) = mask {
+            if m.len() != self.n_vectors {
+                return Err(SearchError::MaskLengthMismatch {
+                    expected: self.n_vectors,
+                    got: m.len(),
+                });
+            }
+        }
+        let rotation = self
+            .rotation
+            .get_or_init(|| rotation::Rotation::new(dim));
+        let centroids = self.centroids.get_or_init(|| {
+            let (_, c) = codebook::codebook(self.bit_width, dim);
+            c
+        });
+        let packed_mask = mask.map(|m| {
+            let n_words = self.n_vectors.div_ceil(64);
+            let mut buf = Vec::with_capacity(n_words);
+            let mut allowed = 0usize;
+            for chunk in m.chunks(64) {
+                let mut word = 0u64;
+                for (bit, &b) in chunk.iter().enumerate() {
+                    word |= (b as u64) << bit;
+                }
+                allowed += word.count_ones() as usize;
+                buf.push(word);
+            }
+            (buf, allowed)
+        });
+        let n_allowed = packed_mask.as_ref().map_or(self.n_vectors, |p| p.1);
+        let packed_mask = packed_mask.map(|p| p.0);
+        let effective_k = k.min(self.n_vectors).min(n_allowed);
+        if effective_k == 0 {
+            return Ok(SearchResults {
+                scores: Vec::new(),
+                indices: Vec::new(),
+                nq,
+                k: 0,
+            });
+        }
+        let (_, n_byte_groups, _) = pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
+        let block_bytes = n_byte_groups * BLOCK;
+        let mut kept: Vec<Vec<(f32, i64)>> = vec![Vec::with_capacity(effective_k); nq];
+        // One buffer is reused across queries and chunks. Both inputs to the
+        // merge are already in the kernel's total order, so retaining the
+        // best k is linear in k instead of sorting up to 2k after every
+        // chunk. Large result windows are a primary serving shape.
+        let mut merge_scratch: Vec<(f32, i64)> = Vec::with_capacity(effective_k);
+        let mut floors = vec![initial_threshold; nq];
+        let mut base = 0usize;
+        while base < self.n_vectors {
+            let live = STREAM_CHUNK_ROWS.min(self.n_vectors - base);
+            let chunk = mapped.chunk(base, live).map_err(|e| SearchError::MappedImage {
+                message: e.to_string(),
+            })?;
+            let (chunk_blocks, _, _) = pack::blocked_geometry(live, self.bit_width, dim);
+            let mask_slice = packed_mask
+                .as_deref()
+                .map(|m| &m[base / 64..base / 64 + live.div_ceil(64)]);
+            let kernel_floor = floors.iter().copied().fold(f32::INFINITY, f32::min);
+            let (scores, indices) = search::search(
+                queries,
+                nq,
+                rotation,
+                &chunk.codes[..chunk_blocks * block_bytes],
+                centroids,
+                &chunk.scales[..live],
+                &self.tqplus_shift,
+                &self.tqplus_scale,
+                self.bit_width,
+                dim,
+                live,
+                chunk_blocks,
+                effective_k,
+                mask_slice,
+                // A mapped chunk is assembled in the classic layout.
+                None,
+                kernel_floor,
+            );
+            let kb = scores.len() / nq;
+            for qi in 0..nq {
+                merge_scratch.clear();
+                let mut left = 0usize;
+                let mut right = 0usize;
+                while merge_scratch.len() < effective_k {
+                    while right < kb {
+                        let at = qi * kb + right;
+                        if indices[at] >= 0 && scores[at] >= floors[qi] {
+                            break;
+                        }
+                        right += 1;
+                    }
+                    let prior = kept[qi].get(left).copied();
+                    let incoming = (right < kb).then(|| {
+                        let at = qi * kb + right;
+                        (scores[at], indices[at] + base as i64)
+                    });
+                    match (prior, incoming) {
+                        (Some(a), Some(b))
+                            if b.0
+                                .partial_cmp(&a.0)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then_with(|| a.1.cmp(&b.1))
+                                != std::cmp::Ordering::Greater =>
+                        {
+                            merge_scratch.push(a);
+                            left += 1;
+                        }
+                        (Some(_), Some(b)) | (None, Some(b)) => {
+                            merge_scratch.push(b);
+                            right += 1;
+                        }
+                        (Some(a), None) => {
+                            merge_scratch.push(a);
+                            left += 1;
+                        }
+                        (None, None) => break,
+                    }
+                }
+                std::mem::swap(&mut kept[qi], &mut merge_scratch);
+                if kept[qi].len() >= effective_k {
+                    let kth = kept[qi][effective_k - 1].0;
+                    if kth > floors[qi] {
+                        floors[qi] = kth;
+                    }
+                }
+            }
+            base += live;
+        }
+        let mut scores = Vec::with_capacity(nq * effective_k);
+        let mut indices = Vec::with_capacity(nq * effective_k);
+        for cands in &kept {
+            for j in 0..effective_k {
+                match cands.get(j) {
+                    Some(&(s, i)) => {
+                        scores.push(s);
+                        indices.push(i);
+                    }
+                    None => {
+                        scores.push(f32::NEG_INFINITY);
+                        indices.push(-1);
+                    }
+                }
+            }
+        }
+        Ok(SearchResults {
+            scores,
+            indices,
+            nq,
+            k: effective_k,
+        })
+    }
+
+    /// The blocked layout when any exists: the owned cache, or the one a
+    /// mapped index materializes on request.
+    fn blocked_any(&self) -> Option<&BlockedCache> {
+        match self.blocked.get() {
+            Some(cache) => Some(cache),
+            None => self.blocked_materialized(),
+        }
+    }
+
+    /// The whole blocked layout of a mapped index, for reads that need
+    /// all of it at once (`write`, `to_bytes`, the packed rows): every
+    /// chunk assembled once and kept — the one copy of the image a
+    /// mapped index ever makes, and only on request.
+    fn blocked_materialized(&self) -> Option<&BlockedCache> {
+        let mapped = self.mapped.as_ref()?;
+        let dim = self.dim?;
+        if self.n_vectors == 0 {
+            return None;
+        }
+        Some(self.blocked.get_or_init(|| {
+            let (n_blocks, n_byte_groups, total) =
+                pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
+            let block_bytes = n_byte_groups * BLOCK;
+            let mut data = Vec::with_capacity(total);
+            let mut scales = Vec::with_capacity(self.n_vectors);
+            let mut base = 0usize;
+            while base < self.n_vectors {
+                let live = STREAM_CHUNK_ROWS.min(self.n_vectors - base);
+                let chunk = mapped
+                    .chunk(base, live)
+                    .unwrap_or_else(|e| panic!("materialize mapped image: {e}"));
+                let (chunk_blocks, _, _) = pack::blocked_geometry(live, self.bit_width, dim);
+                data.extend_from_slice(&chunk.codes[..chunk_blocks * block_bytes]);
+                scales.extend_from_slice(&chunk.scales[..live]);
+                base += live;
+            }
+            let _ = self.mapped_scales.set(scales);
+            BlockedCache {
+                data,
+                n_blocks,
+                low: Vec::new(),
+                outer_frac: OnceLock::new(),
+                sample: OnceLock::new(),
+            }
+        }))
+    }
+
+    /// The per-vector scales: the index's own, or a mapped index's
+    /// materialized with its layout.
+    fn scales_any(&self) -> &[f32] {
+        if self.mapped.is_none() {
+            return &self.scales;
+        }
+        let _ = self.blocked_materialized();
+        self.mapped_scales.get().map_or(&[], Vec::as_slice)
+    }
+
+    /// Stream every candidate scoring at or above a floor to a sink,
+    /// chunk by chunk, with no top-k and no heap: the only per-query
+    /// state is a score floor the sink may raise as the scan advances.
+    ///
+    /// This is the collector for a caller that owns `k` itself: a
+    /// coordinator merging several indexes keeps the global k-th best
+    /// and relays it back as [`StreamControl::RaiseFloor`], so each
+    /// index emits exactly the candidates that can still matter and
+    /// nothing is lost to a shard-local cutoff. On a single index it
+    /// is "give me everything above `s`", sorted within each batch.
+    ///
+    /// Mechanics: the slot space is walked in fixed emission chunks
+    /// (`STREAM_CHUNK_ROWS` rows of whole SIMD blocks). Each chunk is
+    /// scored once (all queries together) through the same kernel as
+    /// [`Self::search_with_options`], asked for every live row of the
+    /// chunk with the current floors seeded, so scores are bitwise
+    /// identical to a top-k search with the same query batch and
+    /// nothing can be displaced from a heap that has room for the
+    /// whole chunk. After each chunk, one [`StreamBatch`] per query
+    /// with surviving candidates is handed to the sink; the sink's
+    /// verdict is applied before the next chunk is scored. The kernel
+    /// prunes at the minimum floor across queries; each query's
+    /// emissions are then filtered to its own floor, so per-query
+    /// floors are exact even though the scoring pass is shared.
+    ///
+    /// Emission order: scores descend within a batch; a query's batches
+    /// ascend by `block_base`; there is no global order across chunks
+    /// or queries. Merging is the caller's job, by construction.
+    ///
+    /// `options.initial_threshold` is every query's starting floor
+    /// (`None` streams the entire index); `options.mask` restricts
+    /// slots exactly as in [`Self::search_with_mask`].
+    ///
+    /// # Panics
+    ///
+    /// - If `options.initial_threshold` or a raised floor is NaN.
+    /// - Plus the same panics as [`Self::search_with_mask`].
+    pub fn search_streaming<F>(
+        &self,
+        queries: &[f32],
+        options: SearchOptions<'_>,
+        sink: F,
+    ) -> StreamSummary
+    where
+        F: FnMut(&StreamBatch<'_>) -> StreamControl,
+    {
+        self.try_search_streaming(queries, options, sink)
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// [`Self::search_streaming`] as a `Result`: the non-panicking
+    /// form, with the same validation as
+    /// [`Self::try_search_with_options`]. NaN floors stay asserts in
+    /// both forms: they are API misuse, not input data.
+    pub fn try_search_streaming<F>(
+        &self,
+        queries: &[f32],
+        options: SearchOptions<'_>,
+        sink: F,
+    ) -> Result<StreamSummary, SearchError>
+    where
+        F: FnMut(&StreamBatch<'_>) -> StreamControl,
+    {
+        self.try_search_streaming_chunked(queries, options, STREAM_CHUNK_ROWS, sink)
+    }
+
+    /// [`Self::try_search_streaming`] with a control callback polled before
+    /// every scan chunk, including chunks that emit no candidate batch.
+    #[doc(hidden)]
+    pub fn try_search_streaming_controlled<F, C>(
+        &self,
+        queries: &[f32],
+        options: SearchOptions<'_>,
+        sink: F,
+        control: C,
+    ) -> Result<StreamSummary, SearchError>
+    where
+        F: FnMut(&StreamBatch<'_>) -> StreamControl,
+        C: FnMut() -> StreamControl,
+    {
+        self.try_search_streaming_chunked_controlled(
+            queries,
+            options,
+            STREAM_CHUNK_ROWS,
+            sink,
+            control,
+        )
+    }
+
+    /// [`Self::try_search_streaming`] with an explicit emission-chunk
+    /// row count. The chunk size changes only the batch cadence, which
+    /// rows arrive together and how often floor raises can bind; never
+    /// the emitted set or the scores. Public for the integration tests,
+    /// which need small chunks to exercise multi-batch behavior on
+    /// small indexes; production callers want the default.
+    #[doc(hidden)]
+    pub fn try_search_streaming_chunked<F>(
+        &self,
+        queries: &[f32],
+        options: SearchOptions<'_>,
+        chunk_rows: usize,
+        sink: F,
+    ) -> Result<StreamSummary, SearchError>
+    where
+        F: FnMut(&StreamBatch<'_>) -> StreamControl,
+    {
+        self.try_search_streaming_chunked_controlled(
+            queries,
+            options,
+            chunk_rows,
+            sink,
+            || StreamControl::Continue,
+        )
+    }
+
+    /// Streaming search with a control callback polled before every chunk.
+    /// Unlike the batch sink, `control` is called even when the current floor
+    /// admits no candidates, so an external coordinator can still cancel the
+    /// scan or raise the floor without waiting for another emitted batch.
+    #[doc(hidden)]
+    pub fn try_search_streaming_chunked_controlled<F, C>(
+        &self,
+        queries: &[f32],
+        options: SearchOptions<'_>,
+        chunk_rows: usize,
+        mut sink: F,
+        mut control: C,
+    ) -> Result<StreamSummary, SearchError>
+    where
+        F: FnMut(&StreamBatch<'_>) -> StreamControl,
+        C: FnMut() -> StreamControl,
+    {
+        assert!(
+            chunk_rows > 0 && chunk_rows % 64 == 0,
+            "chunk_rows must be a positive multiple of 64 \
+             (whole mask words of whole SIMD blocks), got {chunk_rows}",
+        );
+        let mask = options.mask;
+        let start_floor = options.initial_threshold.unwrap_or(f32::NEG_INFINITY);
+        assert!(!start_floor.is_nan(), "initial_threshold must not be NaN");
+        let done = |nq: usize, emitted: usize, chunks: usize| StreamSummary {
+            nq,
+            emitted,
+            blocks_scanned: chunks,
+            completed: true,
+        };
+        // The empty-index cases mirror `try_search_with_options`: a
+        // lazy index that has never seen an add, or an index with no
+        // vectors, has nothing to emit and completes trivially.
+        let Some(dim) = self.dim else {
+            return Ok(done(0, 0, 0));
+        };
+        let nq = queries.len() / dim;
+        if queries.len() != nq * dim {
+            return Err(SearchError::QueryBufferNotMultipleOfDim {
+                queries_len: queries.len(),
+                dim,
+            });
+        }
+        if let Some((vi, ci, v)) = first_invalid_coord(queries, dim) {
+            return Err(SearchError::InvalidQueryValue {
+                query_index: vi,
+                coord_index: ci,
+                value: v,
+            });
+        }
+        if self.n_vectors == 0 {
+            if let Some(m) = mask {
+                if !m.is_empty() {
+                    return Err(SearchError::MaskLengthMismatch {
+                        expected: 0,
+                        got: m.len(),
+                    });
+                }
+            }
+            return Ok(done(nq, 0, 0));
+        }
+        if nq == 0 {
+            return Ok(done(0, 0, 0));
+        }
+
+        let rotation = self
+            .rotation
+            .get_or_init(|| rotation::Rotation::new(dim));
+        let centroids = self.centroids.get_or_init(|| {
+            let (_, c) = codebook::codebook(self.bit_width, dim);
+            c
+        });
+        // An owned index scans its blocked cache; a mapped one assembles
+        // each chunk from its pages as the scan reaches it.
+        let owned = match &self.mapped {
+            Some(_) => None,
+            None => Some(self.blocked.get_or_init(|| {
+                BlockedCache::build(self.packed(), self.n_vectors, self.bit_width, dim)
+            })),
+        };
+
+        if let Some(m) = mask {
+            if m.len() != self.n_vectors {
+                return Err(SearchError::MaskLengthMismatch {
+                    expected: self.n_vectors,
+                    got: m.len(),
+                });
+            }
+        }
+        // Same packed-mask build as `try_search_with_options`, minus
+        // the allowed-count (streaming has no `effective_k` to clamp).
+        let packed_mask = mask.map(|m| {
+            let n_words = self.n_vectors.div_ceil(64);
+            let mut buf = Vec::with_capacity(n_words);
+            for chunk in m.chunks(64) {
+                let mut word = 0u64;
+                for (bit, &b) in chunk.iter().enumerate() {
+                    word |= (b as u64) << bit;
+                }
+                buf.push(word);
+            }
+            debug_assert_eq!(buf.len(), n_words);
+            buf
+        });
+
+        let (_, n_byte_groups, _) =
+            pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
+        // Under the planes layout `data` is the sign region (half of each
+        // block) and `low` holds one row per vector.
+        // A mapped chunk is always assembled in the classic layout.
+        let planes_cache = owned.filter(|b| b.is_planes());
+        let block_bytes = if planes_cache.is_some() { n_byte_groups * BLOCK / 2 } else { n_byte_groups * BLOCK };
+        let low_row = dim / 8;
+        let mut floors = vec![start_floor; nq];
+        let mut emitted = 0usize;
+        let mut chunks_scanned = 0usize;
+        let mut batch_scores: Vec<f32> = Vec::new();
+        let mut batch_slots: Vec<i64> = Vec::new();
+        let mut base = 0usize;
+        while base < self.n_vectors {
+            match control() {
+                StreamControl::Continue => {}
+                StreamControl::RaiseFloor(f) => {
+                    assert!(!f.is_nan(), "raised floor must not be NaN");
+                    for floor in &mut floors {
+                        if f > *floor {
+                            *floor = f;
+                        }
+                    }
+                }
+                StreamControl::Stop => {
+                    return Ok(StreamSummary {
+                        nq,
+                        emitted,
+                        blocks_scanned: chunks_scanned,
+                        completed: false,
+                    });
+                }
+            }
+            let live = chunk_rows.min(self.n_vectors - base);
+            // chunk_rows is a multiple of BLOCK, so every chunk starts
+            // on a SIMD block boundary and covers whole blocks; the
+            // blocked layout therefore slices exactly.
+            let (chunk_blocks, _, _) = pack::blocked_geometry(live, self.bit_width, dim);
+            let byte_start = (base / BLOCK) * block_bytes;
+            // chunk_rows is a multiple of 64, so the chunk's mask words
+            // slice exactly out of the full packed mask.
+            let mask_slice = packed_mask
+                .as_deref()
+                .map(|m| &m[base / 64..base / 64 + live.div_ceil(64)]);
+            // `k = live` with the floor seeded returns every candidate
+            // at or above the floor in this chunk: nothing can be
+            // displaced from a heap that has room for the whole chunk.
+            let mapped_chunk = match &self.mapped {
+                Some(m) => Some(m.chunk(base, live).map_err(|e| SearchError::MappedImage {
+                    message: e.to_string(),
+                })?),
+                None => None,
+            };
+            let (codes, scales): (&[u8], &[f32]) = match (&mapped_chunk, owned) {
+                (Some(c), _) => (&c.codes[..chunk_blocks * block_bytes], &c.scales[..live]),
+                (None, Some(blocked)) => (
+                    &blocked.data[byte_start..byte_start + chunk_blocks * block_bytes],
+                    &self.scales[base..base + live],
+                ),
+                (None, None) => unreachable!("an index is owned or mapped"),
+            };
+            let kernel_floor = floors.iter().copied().fold(f32::INFINITY, f32::min);
+            // A planes chunk asks for every row, so its shortlist covers
+            // the chunk and each row gets the exact rescore (no sample, no
+            // estimate in the result); the floor then applies to those
+            // exact scores.
+            let chunk_planes = planes_cache.map(|blocked| search::PlanesRef {
+                low: &blocked.low[base * low_row..(base + live) * low_row],
+                outer_frac: *blocked.outer_frac.get_or_init(|| {
+                    pack::planes_outer_frac(&blocked.data, &blocked.low, self.n_vectors, dim / 4)
+                }),
+                sample: None,
+            });
+            let (scores, indices) = search::search(
+                queries,
+                nq,
+                rotation,
+                codes,
+                centroids,
+                scales,
+                &self.tqplus_shift,
+                &self.tqplus_scale,
+                self.bit_width,
+                dim,
+                live,
+                chunk_blocks,
+                live,
+                mask_slice,
+                chunk_planes,
+                kernel_floor,
+            );
+            chunks_scanned += 1;
+            let kb = scores.len() / nq;
+            for qi in 0..nq {
+                batch_scores.clear();
+                batch_slots.clear();
+                for j in 0..kb {
+                    let idx = indices[qi * kb + j];
+                    if idx < 0 {
+                        continue;
+                    }
+                    let s = scores[qi * kb + j];
+                    // The kernel pruned at the min floor across
+                    // queries; this query's own floor may be higher.
+                    if s < floors[qi] {
+                        continue;
+                    }
+                    batch_scores.push(s);
+                    batch_slots.push(idx + base as i64);
+                }
+                if batch_scores.is_empty() {
+                    continue;
+                }
+                emitted += batch_scores.len();
+                let batch = StreamBatch {
+                    query_index: qi,
+                    block_base: base,
+                    scores: &batch_scores,
+                    slots: &batch_slots,
+                };
+                match sink(&batch) {
+                    StreamControl::Continue => {}
+                    StreamControl::RaiseFloor(f) => {
+                        assert!(!f.is_nan(), "raised floor must not be NaN");
+                        if f > floors[qi] {
+                            floors[qi] = f;
+                        }
+                    }
+                    StreamControl::Stop => {
+                        return Ok(StreamSummary {
+                            nq,
+                            emitted,
+                            blocks_scanned: chunks_scanned,
+                            completed: false,
+                        });
+                    }
+                }
+            }
+            base += live;
+        }
+        Ok(StreamSummary {
+            nq,
+            emitted,
+            blocks_scanned: chunks_scanned,
+            completed: true,
+        })
+    }
+
 
     /// Eagerly populate the search caches (rotation, centroids
     /// and SIMD-blocked code layout).
@@ -1510,11 +2409,11 @@ impl TurboQuantIndex {
             let (_, c) = codebook::codebook(self.bit_width, dim);
             c
         });
-        self.blocked.get_or_init(|| {
-            let (data, n_blocks) =
-                pack::repack(self.packed(), self.n_vectors, self.bit_width, dim);
-            BlockedCache { data, n_blocks }
-        });
+        if self.mapped.is_none() {
+            self.blocked.get_or_init(|| {
+                BlockedCache::build(self.packed(), self.n_vectors, self.bit_width, dim)
+            });
+        }
     }
 
     /// First row NOT covered by the synced file's committed whole
@@ -1608,7 +2507,7 @@ impl TurboQuantIndex {
             n_vectors: self.n_vectors,
             seq_blocks: &seq_blocks,
             row_codes: &row_codes,
-            scales: &self.scales,
+            scales: self.scales_any(),
             ids,
             tqplus_shift: &self.tqplus_shift,
             tqplus_scale: &self.tqplus_scale,
@@ -1666,9 +2565,12 @@ impl TurboQuantIndex {
         // native layout IS sequential-blocked, so this is a stride-32
         // gather; on x86 each byte de-interleaves from its nibble
         // planes (the primitive the scalar search fallback uses).
-        let cache = self.blocked.get().expect("no code layout materialized");
+        let cache = self.blocked_any().expect("no code layout materialized");
         let b = idx / BLOCK;
         let lane = idx % BLOCK;
+        if cache.is_planes() {
+            return pack::planes_read_row(&cache.data, &cache.low, row_bytes, idx);
+        }
         (0..row_bytes)
             .map(|g| pack::read_code(&cache.data, self.bit_width, row_bytes, b, g, lane))
             .collect()
@@ -1697,7 +2599,16 @@ impl TurboQuantIndex {
                 &flat,
             );
         }
-        let cache = self.blocked.get().expect("no code layout materialized");
+        let cache = self.blocked_any().expect("no code layout materialized");
+        if cache.is_planes() {
+            let half = row_bytes / 2;
+            return pack::planes_to_seq(
+                &cache.data[from * half..to * half],
+                &cache.low[from * half..(to * half).min(cache.low.len())],
+                row_bytes,
+                (to - from).min(self.n_vectors.saturating_sub(from)),
+            );
+        }
         let block_bytes = row_bytes * BLOCK;
         pack::native_to_seq(
             &cache.data[from / BLOCK * block_bytes..to / BLOCK * block_bytes],
@@ -1784,7 +2695,7 @@ impl TurboQuantIndex {
             n_vectors: self.n_vectors,
             seq_blocks: &seq_blocks,
             row_codes: &row_codes,
-            scales: &self.scales,
+            scales: self.scales_any(),
             ids: ids_full,
             tqplus_shift: &self.tqplus_shift,
             tqplus_scale: &self.tqplus_scale,
@@ -1818,6 +2729,13 @@ impl TurboQuantIndex {
         kind: u8,
         ids_full: Option<&[u64]>,
     ) -> std::io::Result<()> {
+        if self.mapped.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "the index is a mapped image and read-only; load it with TurboQuantIndex::load \
+                 to sync it",
+            ));
+        }
         let Some(dim) = self.dim else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1886,7 +2804,7 @@ impl TurboQuantIndex {
                 n_vectors: self.n_vectors,
                 seq_blocks: &seq_blocks,
                 row_codes: &row_codes,
-                scales: &self.scales,
+                scales: self.scales_any(),
                 ids: ids_full,
                 tqplus_shift: &self.tqplus_shift,
                 tqplus_scale: &self.tqplus_scale,
@@ -1982,7 +2900,18 @@ impl TurboQuantIndex {
         // transform in place (identity off x86) and it IS the search
         // cache.
         let (_, nbg, _) = pack::blocked_geometry(l.n_vectors, l.bit_width, l.dim);
-        let native = pack::seq_into_native(l.seq_blocked, l.bit_width, nbg);
+        let native = if pack::planes_wanted(l.bit_width, nbg, l.n_vectors) {
+            let (data, low) = pack::planes_from_seq(&l.seq_blocked, nbg, l.n_vectors);
+            BlockedCache { data, low, n_blocks, outer_frac: OnceLock::new(), sample: OnceLock::new() }
+        } else {
+            BlockedCache {
+                data: pack::seq_into_native(l.seq_blocked, l.bit_width, nbg),
+                low: Vec::new(),
+                n_blocks,
+                outer_frac: OnceLock::new(),
+                sample: OnceLock::new(),
+            }
+        };
         let (tqplus_shift, tqplus_scale) =
             Self::normalize_calibration(l.tqplus_shift, l.tqplus_scale);
         // No codebook for the lazy sentinel: it is solved per-dimension
@@ -1999,10 +2928,7 @@ impl TurboQuantIndex {
         let packed_codes = if l.n_vectors == 0 {
             OnceLock::from(Vec::new())
         } else {
-            let _ = blocked.set(BlockedCache {
-                data: native,
-                n_blocks,
-            });
+            let _ = blocked.set(native);
             let _ = boundaries_lock.set(boundaries);
             let _ = centroids_lock.set(centroids);
             OnceLock::new()
@@ -2021,6 +2947,8 @@ impl TurboQuantIndex {
             blocked,
             encode_scratch: Vec::new(),
             encode_scratch_prev: 0,
+            mapped: None,
+            mapped_scales: OnceLock::new(),
             sync_cursor: path.map(|_| l.cursor),
             sync_path: path.map(|p| p.to_path_buf()),
             sync_pending: l.pending_slots.iter().copied().collect(),
@@ -2094,7 +3022,7 @@ impl TurboQuantIndex {
         }
         if let Some(cache) = self.blocked.get() {
             let (_, nbg, _) = pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
-            return pack::native_to_seq(&cache.data, self.bit_width, nbg);
+            return cache.to_seq(self.n_vectors, self.bit_width, nbg);
         }
         pack::repack_seq(self.packed(), self.n_vectors, self.bit_width, dim)
     }
@@ -2237,6 +3165,89 @@ impl TurboQuantIndex {
             return Self::load_v7(path.as_ref());
         }
         Err(io::legacy_format_error(path.as_ref()))
+    }
+
+    /// Serve a v7 image from its file through a memory map
+    /// (`src/mapped.rs`): the superblock and commit headers are parsed
+    /// at open, the block units stay on their pages, and each search
+    /// assembles the chunks it scans from those pages into a bounded
+    /// cache of [`mapped::DEFAULT_CHUNK_CACHE_BYTES`]. Scores are bit for
+    /// bit what [`Self::load`] produces from the same file. The index is
+    /// read-only: `add`, `swap_remove`, `calibrate`, and `sync` refuse;
+    /// `write` and `to_bytes` materialize the layout in memory first.
+    /// A v5 or v6 file is refused with the same conversion advice as `load`.
+    ///
+    /// # Safety
+    ///
+    /// The file and the storage it names must remain unchanged and untruncated
+    /// until every clone of the returned index has been dropped. This is the
+    /// safety requirement of the underlying file-backed memory map.
+    pub unsafe fn load_mapped(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        // SAFETY: the caller accepts the identical lifetime requirement.
+        unsafe { Self::load_mapped_with_cache(path, mapped::DEFAULT_CHUNK_CACHE_BYTES) }
+    }
+
+    /// [`Self::load_mapped`] with an explicit chunk cache budget in bytes.
+    ///
+    /// # Safety
+    ///
+    /// The file and the storage it names must remain unchanged and untruncated
+    /// until every clone of the returned index has been dropped.
+    pub unsafe fn load_mapped_with_cache(
+        path: impl AsRef<Path>,
+        cache_bytes: usize,
+    ) -> std::io::Result<Self> {
+        // SAFETY: the caller accepts the mapping's lifetime requirement.
+        let image = unsafe { mapped::MappedImage::open(path.as_ref(), cache_bytes)? };
+        Ok(Self::from_mapped(image))
+    }
+
+    /// Whether this index serves from a mapped file (see [`Self::load_mapped`]).
+    pub fn is_mapped(&self) -> bool {
+        self.mapped.is_some()
+    }
+
+    fn from_mapped(image: mapped::MappedImage) -> Self {
+        let dim = image.dim();
+        let bit_width = image.bit_width();
+        let n_vectors = image.n_vectors();
+        let (shift, scale) = image.calibration();
+        let (tqplus_shift, tqplus_scale) = Self::normalize_calibration(shift, scale);
+        let boundaries_lock = OnceLock::new();
+        let centroids_lock = OnceLock::new();
+        if dim != 0 {
+            let (boundaries, centroids) = codebook::codebook(bit_width, dim);
+            let _ = boundaries_lock.set(boundaries);
+            let _ = centroids_lock.set(centroids);
+        }
+        Self {
+            dim: (dim != 0).then_some(dim),
+            bit_width,
+            n_vectors,
+            packed_codes: if n_vectors == 0 {
+                OnceLock::from(Vec::new())
+            } else {
+                OnceLock::new()
+            },
+            scales: Vec::new(),
+            tqplus_shift,
+            tqplus_scale,
+            rotation: OnceLock::new(),
+            boundaries: boundaries_lock,
+            centroids: centroids_lock,
+            blocked: OnceLock::new(),
+            encode_scratch: Vec::new(),
+            encode_scratch_prev: 0,
+            mapped: Some(std::sync::Arc::new(image)),
+            mapped_scales: OnceLock::new(),
+            sync_cursor: None,
+            sync_path: None,
+            sync_pending: std::collections::HashSet::new(),
+            sync_fresh: std::collections::HashSet::new(),
+            sync_capture_buf: Vec::new(),
+            sync_capture_at: Vec::new(),
+            calib_gen: 0,
+        }
     }
 
 
@@ -2509,6 +3520,8 @@ impl TurboQuantIndex {
             blocked: OnceLock::new(),
             encode_scratch: Vec::new(),
             encode_scratch_prev: 0,
+            mapped: None,
+            mapped_scales: OnceLock::new(),
             sync_cursor: None,
             sync_path: None,
             sync_pending: std::collections::HashSet::new(),
@@ -2529,9 +3542,103 @@ impl TurboQuantIndex {
         self.packed()
     }
 
+    /// The stored encoding of rows `rows`, copied out without materializing
+    /// the image: `codes` receives the bit-plane packed codes row-major at
+    /// `bit_width * dim / 8` bytes a row, exactly the bytes [`Self::packed_codes`]
+    /// holds for those rows, and `scales` the per-vector correction scales.
+    /// Both vectors are cleared first.
+    ///
+    /// Where [`Self::packed_codes`] converts and retains the whole image on a
+    /// loaded or mapped index, this converts one 32-row block at a time from
+    /// whichever layout the index already holds — the packed rows when they
+    /// exist, else the blocked cache, else one block assembled from the
+    /// mapped pages outside the search's chunk cache — so the memory it
+    /// touches is the caller's range plus one block, independent of the
+    /// image's size, it evicts nothing a query holds, and
+    /// [`Self::packed_ready`] is unchanged by the call. A caller comparing two
+    /// images row by row (a rewrite proof) uses this in bounded pieces.
+    pub fn stored_rows(
+        &self,
+        rows: std::ops::Range<usize>,
+        codes: &mut Vec<u8>,
+        scales: &mut Vec<f32>,
+    ) -> Result<(), StoredRowsError> {
+        codes.clear();
+        scales.clear();
+        if rows.end > self.n_vectors || rows.start > rows.end {
+            return Err(StoredRowsError::RangeOutOfBounds {
+                end: rows.end,
+                n_vectors: self.n_vectors,
+            });
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let Some(dim) = self.dim else {
+            return Err(StoredRowsError::NoRepresentation);
+        };
+        let bits = self.bit_width;
+        let bytes_per_row = bits * dim / 8;
+        if let (Some(packed), None) = (self.packed_codes.get(), self.mapped.as_ref()) {
+            codes.extend_from_slice(&packed[rows.start * bytes_per_row..rows.end * bytes_per_row]);
+            scales.extend_from_slice(&self.scales[rows.clone()]);
+            return Ok(());
+        }
+        let (_, n_byte_groups, _) = pack::blocked_geometry(self.n_vectors, bits, dim);
+        let block_bytes = n_byte_groups * BLOCK;
+        codes.reserve(rows.len() * bytes_per_row);
+        scales.reserve(rows.len());
+        let mut block = rows.start / BLOCK;
+        while block * BLOCK < rows.end {
+            let block_rows = BLOCK.min(self.n_vectors - block * BLOCK);
+            let seq = match (self.mapped.as_ref(), self.blocked.get()) {
+                (Some(mapped), _) => {
+                    // One block assembled straight from the mapped pages,
+                    // outside the search's chunk cache: the copy lives for
+                    // this iteration and evicts nothing a query holds.
+                    let base = block * BLOCK;
+                    let chunk = mapped
+                        .assemble(base, block_rows)
+                        .map_err(|_| StoredRowsError::NoRepresentation)?;
+                    let lo = rows.start.max(base) - base;
+                    let hi = rows.end.min(base + block_rows) - base;
+                    scales.extend_from_slice(&chunk.scales[lo..hi]);
+                    pack::native_to_seq(&chunk.codes[..block_bytes], bits, n_byte_groups)
+                }
+                (None, Some(cache)) => {
+                    let at = block * block_bytes;
+                    let lo = rows.start.max(block * BLOCK);
+                    let hi = rows.end.min(block * BLOCK + block_rows);
+                    scales.extend_from_slice(&self.scales[lo..hi]);
+                    if cache.is_planes() {
+                        // Sign region: half of each block; low region: one
+                        // row of `n_byte_groups / 2` bytes per vector.
+                        let half = n_byte_groups / 2;
+                        let from = block * BLOCK;
+                        pack::planes_to_seq(
+                            &cache.data[from * half..(from + BLOCK) * half],
+                            &cache.low[from * half..(from + block_rows) * half],
+                            n_byte_groups,
+                            block_rows,
+                        )
+                    } else {
+                        pack::native_to_seq(&cache.data[at..at + block_bytes], bits, n_byte_groups)
+                    }
+                }
+                (None, None) => return Err(StoredRowsError::NoRepresentation),
+            };
+            let packed = pack::seq_to_packed(&seq, block_rows, bits, dim);
+            let lo = rows.start.max(block * BLOCK) - block * BLOCK;
+            let hi = rows.end.min(block * BLOCK + block_rows) - block * BLOCK;
+            codes.extend_from_slice(&packed[lo * bytes_per_row..hi * bytes_per_row]);
+            block += 1;
+        }
+        Ok(())
+    }
+
     /// Per-vector correction scales. Pairs with [`Self::from_parts`].
     pub fn scales(&self) -> &[f32] {
-        &self.scales
+        self.scales_any()
     }
 
     /// TQ+ per-coordinate shift calibration (length `dim`, or empty for a
@@ -2597,6 +3704,9 @@ impl TurboQuantIndex {
     /// # }
     /// ```
     pub fn calibrate_2d(&mut self, sample: &[f32], dim: usize) -> Result<(), CalibrateError> {
+        if self.mapped.is_some() {
+            return Err(CalibrateError::MappedReadOnly);
+        }
         // Dim checks first: every later check is expressed in terms of
         // `dim`.
         match self.dim {
@@ -2862,6 +3972,11 @@ impl TurboQuantIndex {
     /// external input, so an out-of-range one is a contract violation
     /// rather than something to report.
     pub fn swap_remove(&mut self, idx: usize) -> usize {
+        assert!(
+            self.mapped.is_none(),
+            "the index is a mapped image and read-only; load it with TurboQuantIndex::load to \
+             modify it"
+        );
         #[cfg(test)]
         if FORCE_SWAP_REMOVE_PANIC.with(|f| f.replace(false)) {
             panic!("forced swap_remove panic (test)");
@@ -2979,6 +4094,8 @@ impl TurboQuantIndex {
             let (new_n_blocks, n_byte_groups, _) =
                 pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
             let block_bytes = n_byte_groups * BLOCK;
+            let planes = cache.is_planes();
+            cache.sample = OnceLock::new();
             if idx != last {
                 // The move already computes slot `idx`'s new code bytes; keep
                 // them when this removal will be serialized as a redo op, so
@@ -2995,10 +4112,27 @@ impl TurboQuantIndex {
                     }
                     &mut capture_buf[off..off + n_byte_groups]
                 });
-                pack::move_lane(&mut cache.data, self.bit_width, n_byte_groups, last, idx, dst);
+                if planes {
+                    // Captures are code-byte rows (they are serialized).
+                    if let Some(out) = dst {
+                        out.copy_from_slice(&pack::planes_read_row(
+                            &cache.data, &cache.low, n_byte_groups, last,
+                        ));
+                    }
+                    pack::planes_move(&mut cache.data, &mut cache.low, n_byte_groups, last, idx);
+                } else {
+                    pack::move_lane(&mut cache.data, self.bit_width, n_byte_groups, last, idx, dst);
+                }
             }
-            pack::zero_lane(&mut cache.data, self.bit_width, n_byte_groups, last);
-            cache.data.truncate(new_n_blocks * block_bytes);
+            if planes {
+                let nsg = n_byte_groups / 2;
+                pack::zero_lane(&mut cache.data, 2, nsg, last);
+                cache.data.truncate(new_n_blocks * nsg * BLOCK);
+                cache.low.truncate(self.n_vectors * nsg);
+            } else {
+                pack::zero_lane(&mut cache.data, self.bit_width, n_byte_groups, last);
+                cache.data.truncate(new_n_blocks * block_bytes);
+            }
             cache.n_blocks = new_n_blocks;
         }
         // Retire stale entries before recording the new state. Two slots
@@ -3371,6 +4505,7 @@ mod x86_scalar_fallback_tests {
 
     #[test]
     fn scalar_fallback_matches_simd_topk() {
+        let _alone = crate::search::SCALAR_FALLBACK_GATE.write().unwrap_or_else(|e| e.into_inner());
         let dim = 64;
         let n = 600;
         let nq = 12;
@@ -3434,6 +4569,63 @@ mod x86_scalar_fallback_tests {
                     "bits={bits}: scalar fallback returned a different top-k than SIMD",
                 );
             }
+        }
+    }
+
+    #[test]
+    fn scalar_fallback_honors_initial_threshold_like_simd() {
+        // The floor gate lives in every kernel variant; this pins the
+        // scalar fallback (score_query_into_heap) to the same seeded
+        // semantics the SIMD kernels get from the integration tests.
+        let _alone = crate::search::SCALAR_FALLBACK_GATE.write().unwrap_or_else(|e| e.into_inner());
+        let dim = 64;
+        let n = 700;
+        let nq = 6;
+        let k = 12;
+        let idx = {
+            let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+            idx.add(&unit_vectors(n, dim, 33));
+            idx
+        };
+        let queries = unit_vectors(nq, dim, 44);
+
+        FORCE_SCALAR_FALLBACK.store(true, Ordering::Relaxed);
+        let baseline = idx.search(&queries, k);
+        // Floor above each row's rank-2 score: exactly the candidates
+        // scoring >= it survive, the rest of the row is padding.
+        let floor = baseline.scores_for_query(0)[2];
+        let seeded = idx.search_with_options(
+            &queries,
+            k,
+            crate::SearchOptions::new().with_initial_threshold(floor),
+        );
+        FORCE_SCALAR_FALLBACK.store(false, Ordering::Relaxed);
+
+        assert_eq!(seeded.k, baseline.k);
+        for qi in 0..nq {
+            let mut expected: Vec<(u32, i64)> = baseline
+                .scores_for_query(qi)
+                .iter()
+                .zip(baseline.indices_for_query(qi))
+                .filter(|(&s, _)| s >= floor)
+                .map(|(&s, &i)| (s.to_bits(), i))
+                .collect();
+            expected.extend(
+                std::iter::repeat((f32::NEG_INFINITY.to_bits(), -1i64))
+                    .take(k - expected.len()),
+            );
+            expected.sort_unstable();
+            let mut got: Vec<(u32, i64)> = seeded
+                .scores_for_query(qi)
+                .iter()
+                .zip(seeded.indices_for_query(qi))
+                .map(|(&s, &i)| (s.to_bits(), i))
+                .collect();
+            got.sort_unstable();
+            assert_eq!(
+                expected, got,
+                "row {qi}: scalar fallback seeded result is not the floor-filtered baseline",
+            );
         }
     }
 }
@@ -4616,5 +5808,118 @@ mod v7_delta_tests {
             TurboQuantIndex::load(&path2).unwrap().to_bytes(),
             rec.to_bytes()
         );
+    }
+}
+
+#[cfg(test)]
+mod stored_rows_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
+        let mut out = vec![0.0f32; n * dim];
+        for x in out.iter_mut() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *x = ((s >> 33) as f64 / (1u64 << 31) as f64 - 1.0) as f32;
+        }
+        out
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("turbovec-stored-rows-{nonce}-{name}"));
+        std::fs::create_dir(&p).unwrap();
+        p.push("index.tv");
+        p
+    }
+
+    /// Every range of every layout equals the packed image's slice, and
+    /// reading through the loaded and mapped forms leaves the packed rows
+    /// (and the mapped blocked cache) unmaterialized.
+    #[test]
+    fn stored_rows_match_packed_codes_without_materializing() {
+        // (bits, dim) chosen so each native layout is exercised: vm8, the
+        // 4-group vector-major unit, and the x86 perm0 interleave.
+        for (bits, dim, n) in [
+            (4usize, 64usize, 1000usize),
+            (3, 64, 333),
+            (2, 8, 77),
+            (4, 32, 32),
+        ] {
+            let mut built = TurboQuantIndex::new(dim, bits).unwrap();
+            built.add(&rows(n, dim, 7));
+            built.prepare();
+            let expected_codes = built.packed_codes().to_vec();
+            let expected_scales = built.scales().to_vec();
+            let bytes_per_row = bits * dim / 8;
+            assert_eq!(expected_codes.len(), n * bytes_per_row);
+
+            let path = temp(&format!("{bits}-{dim}"));
+            built.write(&path).unwrap();
+            let loaded = TurboQuantIndex::load(&path).unwrap();
+            // SAFETY: the file is private to this test and stays unchanged.
+            let mapped = unsafe { TurboQuantIndex::load_mapped(&path) }.unwrap();
+            assert!(!loaded.packed_ready());
+            assert!(!mapped.packed_ready());
+
+            let mut codes = Vec::new();
+            let mut scales = Vec::new();
+            let ranges = [
+                0..n,
+                0..1,
+                n - 1..n,
+                5..37,
+                31..33,
+                (n / 2)..(n / 2 + BLOCK + 3),
+                n.saturating_sub(BLOCK + 1)..n,
+                10..10,
+            ];
+            for index in [&built, &loaded, &mapped] {
+                for range in &ranges {
+                    let range = range.start.min(n)..range.end.min(n);
+                    index
+                        .stored_rows(range.clone(), &mut codes, &mut scales)
+                        .unwrap();
+                    assert_eq!(
+                        codes,
+                        &expected_codes[range.start * bytes_per_row..range.end * bytes_per_row],
+                        "bits={bits} dim={dim} range={range:?}"
+                    );
+                    assert_eq!(
+                        scales,
+                        &expected_scales[range.clone()],
+                        "bits={bits} dim={dim}"
+                    );
+                }
+                assert!(matches!(
+                    index.stored_rows(0..n + 1, &mut codes, &mut scales),
+                    Err(StoredRowsError::RangeOutOfBounds { .. })
+                ));
+            }
+            assert!(
+                !loaded.packed_ready(),
+                "reading rows must not materialize the packed image"
+            );
+            assert!(
+                !mapped.packed_ready(),
+                "reading rows must not materialize the packed image"
+            );
+            assert!(
+                mapped.blocked.get().is_none(),
+                "reading rows must not materialize the mapped blocked cache"
+            );
+            assert!(
+                mapped.mapped_scales.get().is_none(),
+                "reading rows must not materialize the mapped scales"
+            );
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
     }
 }

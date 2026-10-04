@@ -232,6 +232,14 @@ impl Error for ConstructError {}
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum SearchError {
+    /// A mapped image (`TurboQuantIndex::load_mapped`) failed a check
+    /// while a chunk was assembled from its pages: a truncated unit, a
+    /// scale out of range, a file that changed under the mapping.
+    MappedImage {
+        /// The file and what failed.
+        message: String,
+    },
+
     /// The allowlist was `Some` but empty. An empty allowlist selects no
     /// slots, which is almost always a caller-side filter bug rather than
     /// a request for zero results; pass `None` to search everything.
@@ -275,6 +283,7 @@ pub enum SearchError {
 impl fmt::Display for SearchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MappedImage { message } => write!(f, "mapped image: {message}"),
             Self::AllowlistEmpty => write!(f, "allowlist is empty"),
             Self::UnknownId(id) => {
                 write!(f, "id {id} in allowlist is not present in index")
@@ -514,6 +523,11 @@ impl Error for FromPartsError {}
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum CalibrateError {
+    /// The index is a mapped image (`TurboQuantIndex::load_mapped`),
+    /// which serves reads from its file and takes no mutation; load it
+    /// with `TurboQuantIndex::load` to recalibrate it.
+    MappedReadOnly,
+
     /// The sample has fewer rows than a stable quantile fit needs. Below
     /// this floor the fit would come out as identity, which — once
     /// committed — would silently cost the index TQ+ for the rest of its
@@ -595,6 +609,11 @@ impl fmt::Display for CalibrateError {
                  report Calibrated while behaving as Uncalibrated. Pass a \
                  representative sample with real variation."
             ),
+            Self::MappedReadOnly => write!(
+                f,
+                "the index is a mapped image and read-only; load it with \
+                 TurboQuantIndex::load to modify it"
+            ),
             Self::SampleTooSmall { rows, min } => write!(
                 f,
                 "calibration sample has {rows} rows, need at least {min}"
@@ -629,3 +648,38 @@ impl fmt::Display for CalibrateError {
 }
 
 impl Error for CalibrateError {}
+
+/// Why [`TurboQuantIndex::stored_rows`](crate::TurboQuantIndex::stored_rows)
+/// could not copy a row range out of the index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredRowsError {
+    /// The range reaches past the stored vectors.
+    RangeOutOfBounds {
+        /// The requested range's end (exclusive).
+        end: usize,
+        /// Vectors the index holds.
+        n_vectors: usize,
+    },
+    /// The index holds vectors but no readable code layout: neither the
+    /// packed rows nor a blocked or mapped image. Reaching this means a
+    /// mutation invalidated one layout before the other existed.
+    NoRepresentation,
+}
+
+impl fmt::Display for StoredRowsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RangeOutOfBounds { end, n_vectors } => {
+                write!(
+                    f,
+                    "row range ends at {end} but the index holds {n_vectors} vectors"
+                )
+            }
+            Self::NoRepresentation => {
+                write!(f, "index holds vectors but no readable code layout")
+            }
+        }
+    }
+}
+
+impl Error for StoredRowsError {}

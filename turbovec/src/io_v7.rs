@@ -1280,22 +1280,35 @@ fn declared_len(f: &File) -> Option<u64> {
     (geo.unit_at(0) as u64).checked_add(units)
 }
 
-/// [`load`] over an image already in memory.
-///
-/// The path loader has always read the whole file up front and then
-/// indexed around inside that buffer — v7's two header slots and block
-/// units need random access to a *slice*, not to a seekable file. So a
-/// byte image loads by exactly the same code, which is what lets
-/// `from_bytes` accept v7.
-///
-/// `src` names the image in diagnostics (a path, or something like
-/// "the byte image" for `from_bytes`).
-pub(crate) fn load_image(
-    mut raw: Vec<u8>,
-    expect_calib_gen: u64,
-    expect_kind: u8,
-    src: &str,
-) -> io::Result<V7Load> {
+/// Everything [`load_image`] decides before it touches a block unit:
+/// the superblock, the chosen commit header, the tail rows, and the
+/// pending redo ops (payloads copied out). Shared with the mapped
+/// loader (`src/mapped.rs`), which serves the units from their pages.
+pub(crate) struct ParsedImage {
+    pub geo: Geo,
+    pub dim: usize,
+    pub bit_width: usize,
+    pub kind: u8,
+    pub nonce: u64,
+    pub gen: u64,
+    pub n_vectors: usize,
+    /// Committed whole blocks.
+    pub n_blocks: usize,
+    pub total_blocks: usize,
+    pub n_tail: usize,
+    pub tail_row: usize,
+    pub row_bytes: usize,
+    pub block_bytes: usize,
+    /// The `n_tail` tail rows' records, copied out of the header.
+    pub tail: Vec<u8>,
+    pub tqplus_shift: Vec<f32>,
+    pub tqplus_scale: Vec<f32>,
+    /// Per block: `(slot, payload)` absolute writes riding the header.
+    pub ops: Vec<(usize, Vec<(usize, Vec<u8>)>)>,
+    pub pending_slots: Vec<usize>,
+}
+
+pub(crate) fn parse_image(raw: &[u8], expect_kind: u8, src: &str) -> io::Result<ParsedImage> {
     if raw.len() < 11 || &raw[..4] != V7_MAGIC {
         return Err(bad("not a v7 file"));
     }
@@ -1317,7 +1330,7 @@ pub(crate) fn load_image(
             k => format!("unknown v7 index kind {k}"),
         }));
     }
-    let dim = read_u32(&raw, 7)? as usize;
+    let dim = read_u32(raw, 7)? as usize;
     // dim 0 is the lazy sentinel: an index constructed without a
     // dimension that has never seen an add or a calibrate, so no
     // dimension is committed yet. It is only legal with no rows — the
@@ -1341,8 +1354,8 @@ pub(crate) fn load_image(
             raw.len(),
         )));
     }
-    let nonce = read_u64_at(&raw, 11)?;
-    let file_max_ops = read_u32(&raw, 19)? as usize;
+    let nonce = read_u64_at(raw, 11)?;
+    let file_max_ops = read_u32(raw, 19)? as usize;
     if file_max_ops != MAX_OPS {
         return Err(bad(format!(
             "unsupported header ops capacity {file_max_ops} (this build supports {MAX_OPS})"
@@ -1361,13 +1374,13 @@ pub(crate) fn load_image(
     } else {
         let (canon_b, canon_c) = crate::codebook::codebook(bit_width, dim);
         for want in canon_b.iter().chain(canon_c.iter()) {
-            if read_f32(&raw, off)? != *want {
+            if read_f32(raw, off)? != *want {
                 return Err(bad("embedded codebook drifted from the canonical one"));
             }
             off += 4;
         }
     }
-    let n_calib = read_u32(&raw, off)? as usize;
+    let n_calib = read_u32(raw, off)? as usize;
     off += 4;
     if n_calib != 0 && n_calib != dim {
         return Err(bad(format!("calibration length {n_calib} != dim {dim}")));
@@ -1375,18 +1388,18 @@ pub(crate) fn load_image(
     let mut tqplus_shift = Vec::with_capacity(n_calib);
     let mut tqplus_scale = Vec::with_capacity(n_calib);
     for k in 0..n_calib {
-        tqplus_shift.push(read_f32(&raw, off + k * 4)?);
+        tqplus_shift.push(read_f32(raw, off + k * 4)?);
     }
     off += n_calib * 4;
     for k in 0..n_calib {
-        tqplus_scale.push(read_f32(&raw, off + k * 4)?);
+        tqplus_scale.push(read_f32(raw, off + k * 4)?);
     }
     off += n_calib * 4;
     // THE calibration rule, shared with the v6 loader — one function,
     // so the two paths can never diverge again. (The superblock CRC is
     // no defence against an edited payload; it recomputes.)
     crate::io::validate_calibration(&tqplus_shift, &tqplus_scale)?;
-    let stored = read_u32(&raw, off)?;
+    let stored = read_u32(raw, off)?;
     if crc32(&raw[..off]) != stored {
         return Err(bad("corrupt superblock (crc mismatch)"));
     }
@@ -1405,7 +1418,7 @@ pub(crate) fn load_image(
     // interior length is derivable, so the parse walks the used prefix
     // and checks the CRC exactly where the writer put it.
     let tail_row = row_bytes + 4 + geo.id_bytes(1);
-    let parse_hdr = |slot: usize| parse_header_slot(&raw, &geo, slot, raw.len());
+    let parse_hdr = |slot: usize| parse_header_slot(raw, &geo, slot, raw.len());
     // A commit is adopted only if the units its sync wrote are all
     // present with the bytes it recorded — the single-fsync protocol's
     // replacement for a write-ordering barrier. A commit that reached
@@ -1483,6 +1496,69 @@ pub(crate) fn load_image(
         }
         ops_owned.push((*b, owned));
     }
+    let pending_slots = chosen
+        .groups
+        .iter()
+        .flat_map(|(_, ops)| ops.iter().map(|&(s, _)| s))
+        .collect();
+    Ok(ParsedImage {
+        geo,
+        dim,
+        bit_width,
+        kind,
+        nonce,
+        gen,
+        n_vectors,
+        n_blocks,
+        total_blocks,
+        n_tail,
+        tail_row,
+        row_bytes,
+        block_bytes,
+        tail: tail_copy,
+        tqplus_shift,
+        tqplus_scale,
+        ops: ops_owned,
+        pending_slots,
+    })
+}
+
+/// [`load`] over an image already in memory.
+///
+/// The path loader has always read the whole file up front and then
+/// indexed around inside that buffer — v7's two header slots and block
+/// units need random access to a *slice*, not to a seekable file. So a
+/// byte image loads by exactly the same code, which is what lets
+/// `from_bytes` accept v7.
+///
+/// `src` names the image in diagnostics (a path, or something like
+/// "the byte image" for `from_bytes`).
+pub(crate) fn load_image(
+    mut raw: Vec<u8>,
+    expect_calib_gen: u64,
+    expect_kind: u8,
+    src: &str,
+) -> io::Result<V7Load> {
+    let ParsedImage {
+        geo,
+        dim,
+        bit_width,
+        kind,
+        nonce,
+        gen,
+        n_vectors,
+        n_blocks,
+        total_blocks,
+        n_tail,
+        tail_row,
+        row_bytes,
+        block_bytes,
+        tail: tail_copy,
+        tqplus_shift,
+        tqplus_scale,
+        ops: ops_owned,
+        pending_slots,
+    } = parse_image(&raw, expect_kind, src)?;
 
     let mut scales: Vec<f32> = Vec::with_capacity(n_vectors);
     let mut ids: Vec<u64> = Vec::with_capacity(if kind == 1 { n_vectors } else { 0 });
@@ -1570,11 +1646,7 @@ pub(crate) fn load_image(
             calib_gen: expect_calib_gen,
             nonce,
         },
-        pending_slots: chosen
-            .groups
-            .iter()
-            .flat_map(|(_, ops)| ops.iter().map(|&(s, _)| s))
-            .collect(),
+        pending_slots,
     })
 }
 
