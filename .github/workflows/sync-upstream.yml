@@ -28,15 +28,22 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          token: ${{ secrets.SYNC_TOKEN || github.token }}
+          persist-credentials: false
 
-      - name: Configure git identity
+      # Credentials are not persisted by checkout; only the push steps
+      # get the token, as an extra header scoped to github.com.
+      - name: Configure git identity and push auth
+        env:
+          PUSH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          auth=$(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          git config http.https://github.com/.extraheader "AUTHORIZATION: basic $auth"
 
       - name: Fetch upstream
         run: |
