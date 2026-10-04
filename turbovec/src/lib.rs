@@ -81,6 +81,8 @@ pub mod warning;
 mod kernel_tests;
 #[cfg(test)]
 mod planes_tests;
+#[cfg(test)]
+mod planes_fork_tests;
 
 pub use error::{
     AddError, CalibrateError, ConstructError, FromPartsError, SearchError, StoredRowsError,
@@ -3608,7 +3610,20 @@ impl TurboQuantIndex {
                     let lo = rows.start.max(block * BLOCK);
                     let hi = rows.end.min(block * BLOCK + block_rows);
                     scales.extend_from_slice(&self.scales[lo..hi]);
-                    pack::native_to_seq(&cache.data[at..at + block_bytes], bits, n_byte_groups)
+                    if cache.is_planes() {
+                        // Sign region: half of each block; low region: one
+                        // row of `n_byte_groups / 2` bytes per vector.
+                        let half = n_byte_groups / 2;
+                        let from = block * BLOCK;
+                        pack::planes_to_seq(
+                            &cache.data[from * half..(from + BLOCK) * half],
+                            &cache.low[from * half..(from + block_rows) * half],
+                            n_byte_groups,
+                            block_rows,
+                        )
+                    } else {
+                        pack::native_to_seq(&cache.data[at..at + block_bytes], bits, n_byte_groups)
+                    }
                 }
                 (None, None) => return Err(StoredRowsError::NoRepresentation),
             };
