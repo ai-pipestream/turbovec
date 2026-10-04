@@ -1,0 +1,66 @@
+name: Sync upstream
+
+# Keeps this fork's main a true mirror of RyanCodrai/turbovec main, and
+# keeps the tracked feat/ivf-residual mirror branch current. main carries
+# exactly one extra commit (this workflow), rebased onto upstream each run,
+# so ahead/behind stays truthful. A non-rebaseable upstream (history
+# rewrite) fails the job loudly instead of silently diverging.
+#
+# Rebasing rewrites the sync commit, so the push is a non-fast-forward
+# (guarded by --force-with-lease). GitHub also refuses a GITHUB_TOKEN push
+# whenever upstream edits a file under .github/workflows, so set the
+# SYNC_TOKEN secret to a token with contents:write and workflows:write;
+# without it the job falls back to GITHUB_TOKEN and fails on those days.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Checkout does not persist credentials; this step writes the token
+      # as a github.com extra header, used by the fetch and both pushes.
+      - name: Configure git identity and push auth
+        env:
+          PUSH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          auth=$(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          git config http.https://github.com/.extraheader "AUTHORIZATION: basic $auth"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/RyanCodrai/turbovec.git
+          git fetch upstream
+
+      - name: Rebase main onto upstream/main
+        run: |
+          git switch main
+          before=$(git rev-parse HEAD)
+          git rebase upstream/main
+          if [ "$(git rev-parse HEAD)" = "$before" ]; then
+            echo "main is already current with upstream"
+            exit 0
+          fi
+          git push --force-with-lease=main:"$before" origin main
+
+      - name: Mirror feat/ivf-residual
+        run: |
+          git push --force origin upstream/feat/ivf-residual:refs/heads/feat/ivf-residual
