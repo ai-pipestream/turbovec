@@ -1330,7 +1330,7 @@ pub(crate) fn parse_image(raw: &[u8], expect_kind: u8, src: &str) -> io::Result<
             k => format!("unknown v7 index kind {k}"),
         }));
     }
-    let dim = read_u32(&raw, 7)? as usize;
+    let dim = read_u32(raw, 7)? as usize;
     // dim 0 is the lazy sentinel: an index constructed without a
     // dimension that has never seen an add or a calibrate, so no
     // dimension is committed yet. It is only legal with no rows — the
@@ -1354,8 +1354,8 @@ pub(crate) fn parse_image(raw: &[u8], expect_kind: u8, src: &str) -> io::Result<
             raw.len(),
         )));
     }
-    let nonce = read_u64_at(&raw, 11)?;
-    let file_max_ops = read_u32(&raw, 19)? as usize;
+    let nonce = read_u64_at(raw, 11)?;
+    let file_max_ops = read_u32(raw, 19)? as usize;
     if file_max_ops != MAX_OPS {
         return Err(bad(format!(
             "unsupported header ops capacity {file_max_ops} (this build supports {MAX_OPS})"
@@ -1374,13 +1374,13 @@ pub(crate) fn parse_image(raw: &[u8], expect_kind: u8, src: &str) -> io::Result<
     } else {
         let (canon_b, canon_c) = crate::codebook::codebook(bit_width, dim);
         for want in canon_b.iter().chain(canon_c.iter()) {
-            if read_f32(&raw, off)? != *want {
+            if read_f32(raw, off)? != *want {
                 return Err(bad("embedded codebook drifted from the canonical one"));
             }
             off += 4;
         }
     }
-    let n_calib = read_u32(&raw, off)? as usize;
+    let n_calib = read_u32(raw, off)? as usize;
     off += 4;
     if n_calib != 0 && n_calib != dim {
         return Err(bad(format!("calibration length {n_calib} != dim {dim}")));
@@ -1388,18 +1388,18 @@ pub(crate) fn parse_image(raw: &[u8], expect_kind: u8, src: &str) -> io::Result<
     let mut tqplus_shift = Vec::with_capacity(n_calib);
     let mut tqplus_scale = Vec::with_capacity(n_calib);
     for k in 0..n_calib {
-        tqplus_shift.push(read_f32(&raw, off + k * 4)?);
+        tqplus_shift.push(read_f32(raw, off + k * 4)?);
     }
     off += n_calib * 4;
     for k in 0..n_calib {
-        tqplus_scale.push(read_f32(&raw, off + k * 4)?);
+        tqplus_scale.push(read_f32(raw, off + k * 4)?);
     }
     off += n_calib * 4;
     // THE calibration rule, shared with the v6 loader — one function,
     // so the two paths can never diverge again. (The superblock CRC is
     // no defence against an edited payload; it recomputes.)
     crate::io::validate_calibration(&tqplus_shift, &tqplus_scale)?;
-    let stored = read_u32(&raw, off)?;
+    let stored = read_u32(raw, off)?;
     if crc32(&raw[..off]) != stored {
         return Err(bad("corrupt superblock (crc mismatch)"));
     }
@@ -1418,7 +1418,7 @@ pub(crate) fn parse_image(raw: &[u8], expect_kind: u8, src: &str) -> io::Result<
     // interior length is derivable, so the parse walks the used prefix
     // and checks the CRC exactly where the writer put it.
     let tail_row = row_bytes + 4 + geo.id_bytes(1);
-    let parse_hdr = |slot: usize| parse_header_slot(&raw, &geo, slot, raw.len());
+    let parse_hdr = |slot: usize| parse_header_slot(raw, &geo, slot, raw.len());
     // A commit is adopted only if the units its sync wrote are all
     // present with the bytes it recorded — the single-fsync protocol's
     // replacement for a write-ordering barrier. A commit that reached
