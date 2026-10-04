@@ -33,8 +33,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # Credentials are not persisted by checkout; only the push steps
-      # get the token, as an extra header scoped to github.com.
+      # Checkout does not persist credentials; this step writes the token
+      # as a github.com extra header, used by the fetch and both pushes.
       - name: Configure git identity and push auth
         env:
           PUSH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
