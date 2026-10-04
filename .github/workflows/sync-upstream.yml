@@ -5,6 +5,12 @@ name: Sync upstream
 # exactly one extra commit (this workflow), rebased onto upstream each run,
 # so ahead/behind stays truthful. A non-rebaseable upstream (history
 # rewrite) fails the job loudly instead of silently diverging.
+#
+# Rebasing rewrites the sync commit, so the push is a non-fast-forward
+# (guarded by --force-with-lease). GitHub also refuses a GITHUB_TOKEN push
+# whenever upstream edits a file under .github/workflows, so set the
+# SYNC_TOKEN secret to a token with contents:write and workflows:write;
+# without it the job falls back to GITHUB_TOKEN and fails on those days.
 
 on:
   schedule:
@@ -14,6 +20,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -21,6 +31,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Fetch upstream
         run: |
@@ -30,8 +46,13 @@ jobs:
       - name: Rebase main onto upstream/main
         run: |
           git switch main
+          before=$(git rev-parse HEAD)
           git rebase upstream/main
-          git push origin main
+          if [ "$(git rev-parse HEAD)" = "$before" ]; then
+            echo "main is already current with upstream"
+            exit 0
+          fi
+          git push --force-with-lease=main:"$before" origin main
 
       - name: Mirror feat/ivf-residual
         run: |
