@@ -52,7 +52,7 @@ merged k-th best back as the floor while several shards scan in
 tandem.
 
 **Mapped serving of v7 images.** `TurboQuantIndex::load_mapped` serves
-a v7 image from its file through a memory map (`turbovec/src/mapped.rs`):
+a v7 or sequential-layout v8 image from its file through a memory map (`turbovec/src/mapped.rs`):
 the superblock and the two commit headers are parsed at open, the block
 units stay on their pages, and each search assembles the chunks it scans
 — codes and scales gathered from the units, the commit header's pending
@@ -64,7 +64,15 @@ and slots are bit for bit those of a loaded index; the `.tv` encoding
 is untouched. A mapped index is read-only (`add`, `swap_remove`,
 `calibrate`, `sync` refuse by name; `write` and `to_bytes` materialize
 the layout on request), and a v5/v6 file is refused with the same
-conversion advice `load` gives. The patch exists for a distributed
+conversion advice `load` gives. Upstream's v8 container can also store a
+planes-gated index's units as bit planes (any index at or past
+`PLANES_MIN_VECTORS` whose geometry and host kernels qualify takes the
+planes layout by default); the chunk assembler only understands the
+sequential-blocked form, so `load_mapped` rejects such a file loudly
+instead of misreading its units — serve it through `load` until the
+assembler grows a planes transform
+(`planes_fork_tests.rs::a_planes_layout_file_is_refused_for_mapped_serving`
+pins the rejection). The patch exists for a distributed
 engine whose sealed shards and segments never change after they are
 written: their images can then be served from the page cache instead
 of a heap copy the size of the file, on every node. Because a file-backed

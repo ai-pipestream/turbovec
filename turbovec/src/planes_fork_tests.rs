@@ -186,3 +186,30 @@ fn stored_rows_read_a_planes_cache_like_a_classic_one() {
         assert_eq!(s0, s1, "scales {range:?}");
     }
 }
+
+#[test]
+fn a_planes_layout_file_is_refused_for_mapped_serving() {
+    if !planes_supported() {
+        return;
+    }
+    let n = 1_000;
+    let data = unit_vectors(n, 47);
+    let _on = PlanesOn::new(0);
+    let mut ix = TurboQuantIndex::new(DIM, 2).unwrap();
+    ix.calibrate(&data[..(2048 * DIM).min(data.len())]).unwrap();
+    ix.add(&data);
+    let _ = ix.search(&data[..DIM], 1);
+    assert!(is_planes(&ix));
+    let path = std::env::temp_dir().join(format!(
+        "turbovec-fork-planes-refuse-{}-{n}.tv",
+        std::process::id()
+    ));
+    ix.write(&path).unwrap();
+    let err = unsafe { TurboQuantIndex::load_mapped(&path) }.unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("bit-plane"), "unexpected refusal: {msg}");
+    // The regular load path serves the same file.
+    let loaded = TurboQuantIndex::load(&path).unwrap();
+    assert_eq!(loaded.len(), n);
+    std::fs::remove_file(&path).ok();
+}

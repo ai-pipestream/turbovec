@@ -148,6 +148,16 @@ impl MappedImage {
                 "mapped serving covers positional images (kind 0) only",
             ));
         }
+        // v8 stores a planes-gated index's units as bit planes; the chunk
+        // assembler only transforms the sequential-blocked form. Refuse
+        // rather than serve a unit whose bytes it would misread.
+        if parsed.geo.layout != crate::io_v7::LAYOUT_SEQ {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "mapped serving covers sequential-layout images; this v8 file \
+                 stores bit-plane units — serve it through TurboQuantIndex::load",
+            ));
+        }
         Ok(MappedImage {
             map,
             geo: parsed.geo,
