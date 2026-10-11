@@ -2018,8 +2018,9 @@ impl TurboQuantIndex {
                 data,
                 n_blocks,
                 low: Vec::new(),
-                outer_frac: OnceLock::new(),
+                stats: OnceLock::new(),
                 sample: OnceLock::new(),
+                centre: OnceLock::new(),
             }
         }))
     }
@@ -2322,12 +2323,25 @@ impl TurboQuantIndex {
             // the chunk and each row gets the exact rescore (no sample, no
             // estimate in the result); the floor then applies to those
             // exact scores.
-            let chunk_planes = planes_cache.map(|blocked| search::PlanesRef {
-                low: &blocked.low[base * low_row..(base + live) * low_row],
-                outer_frac: *blocked.outer_frac.get_or_init(|| {
-                    pack::planes_outer_frac(&blocked.data, &blocked.low, self.n_vectors, dim / 4)
-                }),
-                sample: None,
+            let chunk_planes = planes_cache.map(|blocked| {
+                // Whole-cache stats, mirroring the top-level planes
+                // search; the chunk only re-slices the low region.
+                let stats = *blocked.stats.get_or_init(|| {
+                    pack::planes_stats(
+                        &blocked.data,
+                        &blocked.low,
+                        self.n_vectors,
+                        self.bit_width,
+                        dim / (8 / self.bit_width),
+                        centroids,
+                    )
+                });
+                search::PlanesRef {
+                    low: &blocked.low[base * low_row..(base + live) * low_row],
+                    stats,
+                    sample: None,
+                    centre: None,
+                }
             });
             let (scores, indices) = search::search(
                 queries,
@@ -3723,6 +3737,7 @@ impl TurboQuantIndex {
                         pack::planes_to_seq(
                             &cache.data[from * half..(from + BLOCK) * half],
                             &cache.low[from * half..(from + block_rows) * half],
+                            bits,
                             n_byte_groups,
                             block_rows,
                         )

@@ -264,9 +264,32 @@ fn rss_bytes() -> usize {
 
 /// Opening a mapped image costs the headers, not the image; a load
 /// costs the image. The same file, measured in this process.
+///
+/// The image is past the planes gate on hosts whose kernels read the
+/// layout, and a planes image is not mapped-servable (`load_mapped`
+/// rejects it). The layout is decided by per-process env switches read
+/// through `OnceLock`s, so the measurement re-runs itself in a child
+/// process with the planes layout off at write — the image shape this
+/// contract covers.
 #[cfg(target_os = "linux")]
 #[test]
 fn mapped_open_keeps_resident_memory_far_below_a_load() {
+    if std::env::var_os("TURBOVEC_MAPPED_RSS_CHILD").is_none() {
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new(exe)
+            .args([
+                "mapped_open_keeps_resident_memory_far_below_a_load",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("TURBOVEC_4BIT_PLANES", "0")
+            .env("TURBOVEC_2BIT_PLANES", "0")
+            .env("TURBOVEC_MAPPED_RSS_CHILD", "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "child resident-memory run failed: {status}");
+        return;
+    }
     let dim = 1024;
     let n = 40_000; // 1024 x 4 bits = 512 B/row -> ~20 MiB of codes
     let dir = tempdir("rss");
