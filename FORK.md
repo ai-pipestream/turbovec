@@ -9,7 +9,9 @@ for that collaboration; they do not alter single-index behavior when unused.
 The `main` branch (and `turbovec-pipestream-s23`) carries them rebased onto
 upstream `main` (`scripts/sync-upstream.sh`), and
 [protomolt-search](https://github.com/ai-pipestream/protomolt-search) is
-the distributed engine built on top.
+the distributed engine built on top. The fork is published as the
+`pipestream-turbovec` crate (`scripts/publish-pipestream.sh`), and
+[AGENTS.md](AGENTS.md) has the steps for keeping it current.
 
 ## The patches
 

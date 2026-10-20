@@ -53,7 +53,15 @@ next="turbovec-pipestream-s$((latest + 1))"
 cur_ref="fork/${cur}"
 git show-ref --verify --quiet "refs/remotes/${cur_ref}" || cur_ref="${cur}"
 
-echo "sync-upstream: chain tip is ${cur} ($(git rev-parse --short "${cur_ref}"))"
+# main carries the chain tip plus fork-only commits (FORK.md, AGENTS.md,
+# the publish script, lockfile refreshes). Rebase from main when it holds
+# the tip, so the next chain branch keeps those commits too.
+if git show-ref --verify --quiet refs/remotes/fork/main \
+  && git merge-base --is-ancestor "${cur_ref}" fork/main; then
+  cur_ref="fork/main"
+fi
+
+echo "sync-upstream: chain tip is ${cur} (rebasing from ${cur_ref} at $(git rev-parse --short "${cur_ref}"))"
 
 if [ "$(git rev-parse origin/main)" = "$(git merge-base "${cur_ref}" origin/main)" ]; then
   echo "sync-upstream: already up to date with origin/main ($(git rev-parse --short origin/main))."
