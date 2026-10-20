@@ -126,7 +126,7 @@ results remain byte-for-byte consistent with the original.
 | Repository | Role | Depends on |
 |---|---|---|
 | [RyanCodrai/turbovec](https://github.com/RyanCodrai/turbovec) | Upstream vector index library: 4-bit TurboQuant encoding, SIMD top-k search | — |
-| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `main` (this repo) | Patch fork carrying the patches above | upstream `main` |
+| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `main` (this repo) | Patch fork carrying the patches above, published on crates.io as [`pipestream-turbovec`](https://crates.io/crates/pipestream-turbovec) (library name `turbovec`; see AGENTS.md) | upstream `main` |
 | [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | Standalone single-node gRPC server for the upstream index, with client examples in Go, Java, Python, TypeScript, and Rust | fork branch `main` |
 | [ai-pipestream/protomolt-search](https://github.com/ai-pipestream/protomolt-search) | Distributed hybrid search: sharded vector + BM25 nodes, coordinator with floor sharing, write-ahead log, offline resharding | fork branch `main` |
 | [ai-pipestream/grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis) | Text-analysis sidecar: sentence/token spans, term vectors, static embeddings, served over gRPC | — |

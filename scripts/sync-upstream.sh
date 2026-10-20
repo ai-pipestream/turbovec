@@ -2,18 +2,19 @@
 # Sync our fork patch branch with upstream turbovec.
 #
 # Remote naming in this repo:
-#   origin = upstream (RyanCodrai/turbovec)
-#   fork   = ours     (ai-pipestream/turbovec)
+#   origin  = upstream (RyanCodrai/turbovec)
+#   forgejo = our mirror (git.rokkon.com/ai-pipestream/turbovec)
+#   fork    = ours     (ai-pipestream/turbovec)
 #
-# The fork carries a small patch stack (seeded top-k floor, streaming
-# collector — see FORK.md) rebased onto origin/main. Each sync publishes
-# a NEW branch turbovec-pipestream-s<N+1> because the rebase rewrites
-# history; old -sN branches are left alone (no force-push), and
-# turbovec-search flips its Cargo.toml branch to the new one.
+# The fork carries a small patch stack (see FORK.md) on fork/main,
+# rebased onto origin/main. Each sync rebases fork/main into a NEW
+# branch turbovec-pipestream-s<N+1> because the rebase rewrites history;
+# old -sN branches are left alone (no force-push). main then moves to
+# the new branch under a lease (AGENTS.md, upkeep step 3).
 #
 # Usage: scripts/sync-upstream.sh [--push] [--skip-tests]
 #   --push        after a clean rebase + green tests, push the new -sN
-#                 branch to fork
+#                 branch to forgejo, then fork
 #   --skip-tests  do not run cargo test before publishing (not
 #                 recommended; the test suite is the rebase gate)
 #
@@ -55,16 +56,31 @@ git show-ref --verify --quiet "refs/remotes/${cur_ref}" || cur_ref="${cur}"
 
 echo "sync-upstream: chain tip is ${cur} ($(git rev-parse --short "${cur_ref}"))"
 
-if [ "$(git rev-parse origin/main)" = "$(git merge-base "${cur_ref}" origin/main)" ]; then
+# fork/main is the chain head: the latest sN plus anything committed on
+# main since that sync. Rebasing from sN alone would drop those commits
+# when main moves to the new branch, so start from main and refuse a
+# main that does not contain the latest sN.
+base=fork/main
+if ! git merge-base --is-ancestor "${cur_ref}" "${base}"; then
+  echo "sync-upstream: ${base} does not contain ${cur}; reconcile them by hand." >&2
+  exit 1
+fi
+if [ -n "$(git log --merges --oneline origin/main.."${base}")" ]; then
+  echo "sync-upstream: ${base} has merge commits above origin/main; rebase would flatten them." >&2
+  exit 1
+fi
+
+if [ "$(git rev-parse origin/main)" = "$(git merge-base "${base}" origin/main)" ]; then
   echo "sync-upstream: already up to date with origin/main ($(git rev-parse --short origin/main))."
   exit 0
 fi
 
-new_commits=$(git log --oneline "${cur_ref}"..origin/main | wc -l)
-echo "sync-upstream: ${new_commits} new upstream commit(s); rebasing as ${next}"
-git log --oneline "${cur_ref}"..origin/main
+new_commits=$(git log --oneline "${base}"..origin/main | wc -l)
+echo "sync-upstream: ${new_commits} new upstream commit(s); rebasing ${base} as ${next}"
+git log --oneline "${base}"..origin/main
 
-git checkout -b "${next}" "${cur_ref}"
+old_main=$(git rev-parse "${base}")
+git checkout -b "${next}" "${base}"
 if ! git rebase origin/main; then
   cat >&2 <<EOF
 sync-upstream: CONFLICT rebasing ${next} onto origin/main.
@@ -103,12 +119,15 @@ fi
 echo "sync-upstream: done. ${next} sits on origin/main ($(git rev-parse --short origin/main))."
 
 if [ "${PUSH}" = 1 ]; then
+  git push forgejo "${next}"
   git push fork "${next}"
-  echo "sync-upstream: pushed ${next} to fork (new branch, no force-push)."
+  echo "sync-upstream: pushed ${next} to forgejo and fork (new branch, no force-push)."
   cat <<EOF
-Next step: in turbovec-search, set
-  turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "${next}" }
-then cargo update -p turbovec && cargo test, commit, push forgejo first.
+Next step: move main to ${next} on both remotes, forgejo first:
+  git push --force-with-lease=main:${old_main} forgejo ${next}:refs/heads/main
+  git push --force-with-lease=main:${old_main} fork ${next}:refs/heads/main
+then in protomolt-search and turbovec-grpc: cargo update -p turbovec and
+their full test gate.
 EOF
 else
   echo "sync-upstream: not pushed (pass --push). Branch ${next} is local only."
