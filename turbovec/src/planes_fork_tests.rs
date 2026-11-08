@@ -425,6 +425,7 @@ fn staged_top_k_is_deterministic(bits: usize) {
         let (batched1, singles1) = in_pool(1, k);
         let (batched2, singles2) = in_pool(2, k);
         assert_eq!(batched1, singles1, "bits={bits} k={k} serial single vs batch");
+        assert_eq!(batched2, batched1, "bits={bits} k={k} batch on 2 threads");
         for threads in [2usize, 8] {
             let (batched, singles) = in_pool(threads, k);
             assert_eq!(batched, batched1, "bits={bits} k={k} threads={threads} batched");
