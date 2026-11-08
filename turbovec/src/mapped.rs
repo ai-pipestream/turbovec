@@ -1,4 +1,4 @@
-//! A v7 image served straight from its file through a memory map.
+//! A v7 or v8 image served straight from its file through a memory map.
 //!
 //! [`TurboQuantIndex::load`](crate::TurboQuantIndex::load) reads the whole
 //! image into memory and turns it into the search cache; for an index
@@ -11,7 +11,9 @@
 //!
 //! Nothing about the scoring changes. A v7 block unit stores its 32
 //! rows' codes in the sequential-blocked layout and its 32 scales right
-//! behind them; a chunk gathers the code bytes of its blocks, applies
+//! behind them (a v8 bit-plane unit stores the same codes as canonical
+//! planes, converted back to sequential-blocked bytes on assembly); a
+//! chunk gathers the code bytes of its blocks, applies
 //! the redo ops the loaded commit header carries (exactly as
 //! [`crate::io_v7::load_image`] does), and runs the same
 //! stored-to-native transform the loader runs, so the kernel reads the
@@ -148,14 +150,16 @@ impl MappedImage {
                 "mapped serving covers positional images (kind 0) only",
             ));
         }
-        // v8 stores a planes-gated index's units as bit planes; the chunk
-        // assembler only transforms the sequential-blocked form. Refuse
-        // rather than serve a unit whose bytes it would misread.
-        if parsed.geo.layout != crate::io_v7::LAYOUT_SEQ {
+        // v8 stores a planes-gated index's units as bit planes in their
+        // canonical (host-independent) form; `assemble` turns each such
+        // unit back into sequential-blocked bytes before the shared
+        // stored-to-native transform, so either layout serves.
+        if parsed.geo.layout == crate::io_v7::LAYOUT_PLANES
+            && !pack::planes_geom_ok(parsed.bit_width, parsed.geo.row_bytes())
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "mapped serving covers sequential-layout images; this v8 file \
-                 stores bit-plane units — serve it through TurboQuantIndex::load",
+                "bit-plane units with a geometry that has no planes layout",
             ));
         }
         Ok(MappedImage {
@@ -239,7 +243,23 @@ impl MappedImage {
                     .map
                     .get(at..at + self.geo.unit_len())
                     .ok_or_else(|| self.bad(format!("truncated block unit {b}")))?;
-                out.copy_from_slice(&unit[..block_bytes]);
+                if self.geo.layout == crate::io_v7::LAYOUT_PLANES {
+                    // Canonical sign bytes then the block's low rows ->
+                    // the sequential-blocked bytes a v7 unit would hold
+                    // (the converter's route, `convert::read_v7`).
+                    let (nsg, _) = pack::planes_geom(self.bit_width, row_bytes);
+                    let sb = nsg * BLOCK;
+                    let packed = pack::planes_canonical_to_packed(
+                        &unit[..sb],
+                        &unit[sb..block_bytes],
+                        self.bit_width,
+                        row_bytes,
+                        BLOCK,
+                    );
+                    out.copy_from_slice(&pack::repack_seq(&packed, BLOCK, self.bit_width, self.dim));
+                } else {
+                    out.copy_from_slice(&unit[..block_bytes]);
+                }
                 for lane in 0..BLOCK {
                     let so = block_bytes + lane * 4;
                     let v = f32::from_le_bytes(unit[so..so + 4].try_into().expect("4 bytes"));

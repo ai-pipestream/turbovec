@@ -204,31 +204,83 @@ fn stored_rows_planes_vs_classic(bits: usize) {
     }
 }
 
-#[test]
-fn a_planes_layout_file_is_refused_for_mapped_serving() {
-    if !planes_supported() {
+/// A bit-plane (v8 planes layout) file written by this build serves through
+/// `load_mapped`: every row reads back as a classic load's, and a mapped
+/// scan (classic kernels over assembled chunks) scores bit for bit what a
+/// classic-layout load of the same file scores. Covers a partial tail
+/// block and pending redo ops from an incremental sync.
+fn a_planes_layout_file_serves_mapped(bits: usize, stock_threshold: bool) {
+    if !planes_supported_at(bits) {
         return;
     }
-    let n = 1_000;
-    let data = unit_vectors(n, 47);
-    let _on = PlanesOn::new(0);
-    let mut ix = TurboQuantIndex::new(DIM, 2).unwrap();
+    let n = if stock_threshold { pack::PLANES_MIN_VECTORS + 7_239 } else { 1_000 + 7 };
+    let data = unit_vectors(n, 47 + bits as u64);
+    let q = unit_vectors(4, 48 + bits as u64);
+    let _on = if stock_threshold { None } else { Some(PlanesOn::new(0)) };
+    let mut ix = TurboQuantIndex::new(DIM, bits).unwrap();
     ix.calibrate(&data[..(2048 * DIM).min(data.len())]).unwrap();
     ix.add(&data);
     let _ = ix.search(&data[..DIM], 1);
-    assert!(is_planes(&ix));
+    assert!(is_planes(&ix), "bits={bits}");
     let path = std::env::temp_dir().join(format!(
-        "turbovec-fork-planes-refuse-{}-{n}.tv",
+        "turbovec-fork-planes-mapped-{}-{bits}-{n}.tv",
         std::process::id()
     ));
-    ix.write(&path).unwrap();
-    let err = unsafe { TurboQuantIndex::load_mapped(&path) }.unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("bit-plane"), "unexpected refusal: {msg}");
-    // The regular load path serves the same file.
-    let loaded = TurboQuantIndex::load(&path).unwrap();
-    assert_eq!(loaded.len(), n);
+    ix.sync(&path).unwrap();
+    // A few removals land as redo ops in the next commit header.
+    for v in [3usize, 40, 41, 700] {
+        ix.swap_remove(v);
+    }
+    ix.sync(&path).unwrap();
+    let n = ix.len();
+
+    let mapped = unsafe { TurboQuantIndex::load_mapped(&path) }.unwrap();
+    let base = classic(|| {
+        let b = TurboQuantIndex::load(&path).unwrap();
+        let _ = b.search(&data[..DIM], 1);
+        b
+    });
+    assert!(!is_planes(&base));
+    assert_eq!(mapped.len(), n);
+
+    let (mut c0, mut s0, mut c1, mut s1) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for range in [0..n, 0..1, 31..33, 640..710, n - 7..n] {
+        mapped.stored_rows(range.clone(), &mut c0, &mut s0).unwrap();
+        base.stored_rows(range.clone(), &mut c1, &mut s1).unwrap();
+        assert_eq!(c0, c1, "bits={bits} codes {range:?}");
+        assert_eq!(s0, s1, "bits={bits} scales {range:?}");
+    }
+    for k in [1usize, 10, 100] {
+        let (a, b) = (mapped.search(&q, k), base.search(&q, k));
+        assert_eq!(a.indices, b.indices, "bits={bits} k={k}");
+        let bits_of = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits_of(&a.scores), bits_of(&b.scores), "bits={bits} k={k}");
+    }
+    let top = base.search(&q, 50);
+    let floor = (0..4).map(|qi| top.scores[qi * 50 + 49]).fold(f32::INFINITY, f32::min);
+    assert_eq!(streamed(&mapped, &q, floor, 4_096), streamed(&base, &q, floor, 4_096), "bits={bits}");
+    drop(mapped);
     std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_2bit_planes_layout_file_serves_mapped() {
+    a_planes_layout_file_serves_mapped(2, false);
+}
+
+#[test]
+fn a_4bit_planes_layout_file_serves_mapped() {
+    a_planes_layout_file_serves_mapped(4, false);
+}
+
+#[test]
+fn a_2bit_planes_file_above_the_stock_threshold_serves_mapped() {
+    a_planes_layout_file_serves_mapped(2, true);
+}
+
+#[test]
+fn a_4bit_planes_file_above_the_stock_threshold_serves_mapped() {
+    a_planes_layout_file_serves_mapped(4, true);
 }
 
 #[test]

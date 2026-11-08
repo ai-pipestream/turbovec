@@ -266,11 +266,11 @@ fn rss_bytes() -> usize {
 /// costs the image. The same file, measured in this process.
 ///
 /// The image is past the planes gate on hosts whose kernels read the
-/// layout, and a planes image is not mapped-servable (`load_mapped`
-/// rejects it). The layout is decided by per-process env switches read
+/// layout. The layout is decided by per-process env switches read
 /// through `OnceLock`s, so the measurement re-runs itself in a child
-/// process with the planes layout off at write — the image shape this
-/// contract covers.
+/// process with the planes layout off, keeping the heap load it compares
+/// against in the classic layout this contract was measured on (planes
+/// files serve mapped too; `planes_fork_tests.rs` pins that).
 #[cfg(target_os = "linux")]
 #[test]
 fn mapped_open_keeps_resident_memory_far_below_a_load() {
