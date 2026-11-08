@@ -104,6 +104,21 @@ which reach every heap-init site the patch used to touch by hand.
 runs only on a host whose kernels read the layout (aarch64, or x86 with
 AVX-512 VBMI).
 
+**Exhaustive top-k over the planes layout.** Upstream 1.1 searches an
+index whose cache is in the bit-plane layout in stages (sign-plane
+shortlist, lower-plane ranking, exact rescore of the best): scores are
+exact for the ids returned, the id set is approximate, and a single query
+builds its shortlist differently on one thread than on a pool, so a serial
+and a parallel caller can disagree at k >= 100. `SearchOptions::exhaustive`
+(`with_exhaustive(true)`) runs such a search through the mapped top-k's
+chunk loop instead, every row of each chunk exactly rescored (as the
+streaming collector does) and merged into a global window, so ids and
+scores equal the whole-index scan's bit for bit on any thread count. It is
+a no-op on the classic layout and on mapped images, which are exhaustive
+already. `src/planes_fork_tests.rs` pins the equality at 2 and 4 bits
+(masks, seeded floors, k = 1 to past n) and pins what the staged default
+does and does not keep stable across thread counts.
+
 ## How they are used together
 
 A coordinator fans a query out to N shard indexes, all calibrated

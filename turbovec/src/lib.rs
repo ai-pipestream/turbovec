@@ -661,6 +661,19 @@ pub struct SearchOptions<'a> {
     ///
     /// `None` and `Some(f32::NEG_INFINITY)` are equivalent (no floor).
     pub initial_threshold: Option<f32>,
+
+    /// Score every allowed vector with the exact arithmetic (fork patch).
+    ///
+    /// An index whose search cache is in the bit-plane layout (32,768+
+    /// vectors on a host whose kernels read it) searches top-k in stages
+    /// by default: a sign-plane shortlist, a ranking on the lower planes,
+    /// and an exact rescore of the best. Its scores are exact, but the id
+    /// set can miss vectors the whole-index scan would return. With
+    /// `exhaustive` set, such an index scans chunk by chunk with every row
+    /// exactly rescored and a global top-k merge, so ids and scores equal
+    /// the whole-index scan's bit for bit. The classic layout and mapped
+    /// images are already exhaustive; there the flag changes nothing.
+    pub exhaustive: bool,
 }
 
 impl<'a> SearchOptions<'a> {
@@ -680,6 +693,13 @@ impl<'a> SearchOptions<'a> {
     /// [`SearchOptions::initial_threshold`].
     pub fn with_initial_threshold(mut self, floor: f32) -> Self {
         self.initial_threshold = Some(floor);
+        self
+    }
+
+    /// Require the whole-index scan's result. See
+    /// [`SearchOptions::exhaustive`].
+    pub fn with_exhaustive(mut self, exhaustive: bool) -> Self {
+        self.exhaustive = exhaustive;
         self
     }
 }
@@ -747,6 +767,15 @@ pub struct StreamSummary {
 /// cadence the calibration-block fork chain had, so nothing built on
 /// the batch rhythm re-tunes.
 const STREAM_CHUNK_ROWS: usize = 8192;
+
+/// Where [`TurboQuantIndex::search_chunked`] reads its chunks from.
+#[derive(Clone, Copy)]
+enum ChunkSource<'a> {
+    /// A mapped image, assembled chunk by chunk in the classic layout.
+    Mapped(&'a mapped::MappedImage),
+    /// An owned bit-plane cache, searched exhaustively.
+    Planes(&'a BlockedCache),
+}
 
 impl TurboQuantIndex {
     /// The packed bit-plane codes, materializing them from the blocked
@@ -1689,7 +1718,7 @@ impl TurboQuantIndex {
             });
         }
         if let Some(mapped) = &self.mapped {
-            return self.search_mapped(mapped, queries, nq, dim, k, mask, initial_threshold);
+            return self.search_chunked(ChunkSource::Mapped(mapped), queries, nq, dim, k, mask, initial_threshold);
         }
 
         let rotation = self
@@ -1720,6 +1749,9 @@ impl TurboQuantIndex {
                     got: m.len(),
                 });
             }
+        }
+        if options.exhaustive && blocked.is_planes() {
+            return self.search_chunked(ChunkSource::Planes(blocked), queries, nq, dim, k, mask, initial_threshold);
         }
         let packed_mask = mask.map(|m| {
             // Build word-at-a-time out of 64-bool chunks and count the
@@ -1806,17 +1838,20 @@ impl TurboQuantIndex {
         })
     }
 
-    /// Top-k over a mapped image: the chunk loop of the streaming scan
-    /// with a global heap per query. Each chunk goes through the kernel
+    /// Top-k over a mapped image, or exhaustive top-k over a bit-plane
+    /// cache: the chunk loop of the streaming scan with a global window
+    /// per query. A planes chunk asks the kernel for every row, so each
+    /// row is exactly rescored (as `search_streaming` does) and the
+    /// window merge keeps the best `k`. Each chunk goes through the kernel
     /// with `k` and the query batch's current k-th-best as the floor
     /// (a true lower bound, so pruning is exact and ties at the floor
     /// survive), and the union of the chunks' top-k is the top-k of
     /// the whole image, ordered by the kernel's rule: score descending,
     /// then slot ascending. Scores are the kernel's own, bit for bit.
     #[allow(clippy::too_many_arguments)]
-    fn search_mapped(
+    fn search_chunked(
         &self,
-        mapped: &mapped::MappedImage,
+        source: ChunkSource<'_>,
         queries: &[f32],
         nq: usize,
         dim: usize,
@@ -1876,33 +1911,78 @@ impl TurboQuantIndex {
         let mut base = 0usize;
         while base < self.n_vectors {
             let live = STREAM_CHUNK_ROWS.min(self.n_vectors - base);
-            let chunk = mapped.chunk(base, live).map_err(|e| SearchError::MappedImage {
-                message: e.to_string(),
-            })?;
             let (chunk_blocks, _, _) = pack::blocked_geometry(live, self.bit_width, dim);
             let mask_slice = packed_mask
                 .as_deref()
                 .map(|m| &m[base / 64..base / 64 + live.div_ceil(64)]);
             let kernel_floor = floors.iter().copied().fold(f32::INFINITY, f32::min);
-            let (scores, indices) = search::search(
-                queries,
-                nq,
-                rotation,
-                &chunk.codes[..chunk_blocks * block_bytes],
-                centroids,
-                &chunk.scales[..live],
-                &self.tqplus_shift,
-                &self.tqplus_scale,
-                self.bit_width,
-                dim,
-                live,
-                chunk_blocks,
-                effective_k,
-                mask_slice,
-                // A mapped chunk is assembled in the classic layout.
-                None,
-                kernel_floor,
-            );
+            let (scores, indices) = match source {
+                ChunkSource::Mapped(mapped) => {
+                    let chunk = mapped.chunk(base, live).map_err(|e| SearchError::MappedImage {
+                        message: e.to_string(),
+                    })?;
+                    search::search(
+                        queries,
+                        nq,
+                        rotation,
+                        &chunk.codes[..chunk_blocks * block_bytes],
+                        centroids,
+                        &chunk.scales[..live],
+                        &self.tqplus_shift,
+                        &self.tqplus_scale,
+                        self.bit_width,
+                        dim,
+                        live,
+                        chunk_blocks,
+                        effective_k,
+                        mask_slice,
+                        // A mapped chunk is assembled in the classic layout.
+                        None,
+                        kernel_floor,
+                    )
+                }
+                ChunkSource::Planes(blocked) => {
+                    // Same slicing and stats as `search_streaming` over a
+                    // planes cache; `k = live` makes the shortlist the whole
+                    // chunk, so every row gets the exact rescore.
+                    let (nsg, low_row) = pack::planes_geom(self.bit_width, n_byte_groups);
+                    let sign_bytes = nsg * BLOCK;
+                    let byte_start = (base / BLOCK) * sign_bytes;
+                    let stats = *blocked.stats.get_or_init(|| {
+                        pack::planes_stats(
+                            &blocked.data,
+                            &blocked.low,
+                            self.n_vectors,
+                            self.bit_width,
+                            n_byte_groups,
+                            centroids,
+                        )
+                    });
+                    search::search(
+                        queries,
+                        nq,
+                        rotation,
+                        &blocked.data[byte_start..byte_start + chunk_blocks * sign_bytes],
+                        centroids,
+                        &self.scales[base..base + live],
+                        &self.tqplus_shift,
+                        &self.tqplus_scale,
+                        self.bit_width,
+                        dim,
+                        live,
+                        chunk_blocks,
+                        live,
+                        mask_slice,
+                        Some(search::PlanesRef {
+                            low: &blocked.low[base * low_row..(base + live) * low_row],
+                            stats,
+                            sample: None,
+                            centre: None,
+                        }),
+                        kernel_floor,
+                    )
+                }
+            };
             let kb = scores.len() / nq;
             for qi in 0..nq {
                 merge_scratch.clear();

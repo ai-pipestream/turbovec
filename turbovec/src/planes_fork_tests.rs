@@ -81,7 +81,7 @@ fn seeded(ix: &TurboQuantIndex, q: &[f32], k: usize, floor: f32) -> Vec<Vec<(i64
     let r = ix.search_with_options(
         q,
         k,
-        SearchOptions { mask: None, initial_threshold: Some(floor) },
+        SearchOptions::new().with_initial_threshold(floor),
     );
     (0..r.nq)
         .map(|qi| {
@@ -131,7 +131,7 @@ fn streamed(ix: &TurboQuantIndex, q: &[f32], floor: f32, chunk_rows: usize) -> V
     let summary = ix
         .try_search_streaming_chunked(
             q,
-            SearchOptions { mask: None, initial_threshold: Some(floor) },
+            SearchOptions::new().with_initial_threshold(floor),
             chunk_rows,
             |b| {
                 for (&s, &i) in b.scores.iter().zip(b.slots) {
@@ -332,3 +332,126 @@ fn streaming_a_2bit_index_above_the_stock_planes_threshold() {
 fn streaming_a_4bit_index_above_the_stock_planes_threshold() {
     streaming_above_the_stock_planes_threshold(4);
 }
+
+/// (slot, score bits) per query, for comparing whole result sets.
+fn rows_of(r: &crate::SearchResults) -> Vec<Vec<(i64, u32)>> {
+    (0..r.nq)
+        .map(|qi| {
+            (0..r.k)
+                .map(|j| (r.indices[qi * r.k + j], r.scores[qi * r.k + j].to_bits()))
+                .collect()
+        })
+        .collect()
+}
+
+/// `SearchOptions::exhaustive` on a planes cache past the stock threshold
+/// returns the whole-index scan's top-k bit for bit: ids, scores, padding,
+/// with and without a mask and a seeded floor, from k = 1 to past n.
+fn exact(o: SearchOptions<'_>) -> SearchOptions<'_> {
+    o.with_exhaustive(true)
+}
+
+fn exhaustive_planes_top_k_equals_the_classic_scan(bits: usize) {
+    if !planes_supported_at(bits) {
+        return;
+    }
+    let n = pack::PLANES_MIN_VECTORS + 7_232;
+    let data = unit_vectors(n, 80 + bits as u64);
+    let q = unit_vectors(5, 90 + bits as u64);
+    let base = classic(|| build_bits(&data, bits));
+    let ix = build_bits(&data, bits);
+    assert!(is_planes(&ix) && !is_planes(&base), "bits={bits}");
+    let mask: Vec<bool> = (0..n).map(|v| v % 3 != 1).collect();
+    for k in [1usize, 10, 100, 1_000, n + 5] {
+        let want = base.search(&q, k);
+        let got = ix.search_with_options(&q, k, exact(SearchOptions::new()));
+        assert_eq!(rows_of(&got), rows_of(&want), "bits={bits} k={k}");
+        let want = base.search_with_options(&q, k, SearchOptions::new().with_mask(&mask));
+        let got = ix.search_with_options(&q, k, exact(SearchOptions::new().with_mask(&mask)));
+        assert_eq!(rows_of(&got), rows_of(&want), "bits={bits} k={k} masked");
+        if k <= 100 {
+            // A floor at the k-th best of the first query cuts every row.
+            let floor = base.search(&q[..DIM], k).scores[k - 1];
+            let seed = SearchOptions::new().with_initial_threshold(floor);
+            let want = base.search_with_options(&q, k, seed);
+            let got = ix.search_with_options(&q, k, exact(seed));
+            assert_eq!(rows_of(&got), rows_of(&want), "bits={bits} k={k} seeded");
+        }
+    }
+    // The flag is a no-op on the classic layout.
+    let k = 10;
+    assert_eq!(
+        rows_of(&base.search_with_options(&q, k, exact(SearchOptions::new()))),
+        rows_of(&base.search(&q, k))
+    );
+}
+
+#[test]
+fn exhaustive_2bit_planes_top_k_equals_the_classic_scan() {
+    exhaustive_planes_top_k_equals_the_classic_scan(2);
+}
+
+#[test]
+fn exhaustive_4bit_planes_top_k_equals_the_classic_scan() {
+    exhaustive_planes_top_k_equals_the_classic_scan(4);
+}
+
+/// The staged (default) search is deterministic: the same index and
+/// queries return the same ids and score bits on every call, and a batch
+/// returns the same rows on 1, 2 or 8 threads. One query per call is
+/// stable across every pool of two or more threads, but its shortlist is
+/// built differently on one thread (upstream's single-query pool route),
+/// so a serial and a parallel caller can disagree on ids at k >= 100;
+/// only `exhaustive` removes that.
+fn staged_top_k_is_deterministic(bits: usize) {
+    if !planes_supported_at(bits) {
+        return;
+    }
+    let n = pack::PLANES_MIN_VECTORS + 7_232;
+    let data = unit_vectors(n, 100 + bits as u64);
+    let q = unit_vectors(6, 110 + bits as u64);
+    let ix = build_bits(&data, bits);
+    assert!(is_planes(&ix), "bits={bits}");
+    let in_pool = |threads: usize, k: usize| {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        pool.install(|| {
+            let batched = rows_of(&ix.search(&q, k));
+            let singles: Vec<Vec<(i64, u32)>> =
+                q.chunks(DIM).flat_map(|one| rows_of(&ix.search(one, k))).collect();
+            (batched, singles)
+        })
+    };
+    for k in [1usize, 10, 100, 1_000] {
+        let (batched1, singles1) = in_pool(1, k);
+        let (batched2, singles2) = in_pool(2, k);
+        assert_eq!(batched1, singles1, "bits={bits} k={k} serial single vs batch");
+        for threads in [2usize, 8] {
+            let (batched, singles) = in_pool(threads, k);
+            assert_eq!(batched, batched1, "bits={bits} k={k} threads={threads} batched");
+            assert_eq!(singles, singles2, "bits={bits} k={k} threads={threads} singles");
+            assert_eq!(in_pool(threads, k), (batched, singles), "bits={bits} k={k} repeat");
+        }
+        // Exhaustive is one answer everywhere.
+        let want = rows_of(&ix.search_with_options(&q, k, exact(SearchOptions::new())));
+        for threads in [1usize, 2, 8] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            let got = pool.install(|| {
+                q.chunks(DIM)
+                    .flat_map(|one| rows_of(&ix.search_with_options(one, k, exact(SearchOptions::new()))))
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(got, want, "bits={bits} k={k} threads={threads} exhaustive");
+        }
+    }
+}
+
+#[test]
+fn staged_2bit_top_k_is_deterministic() {
+    staged_top_k_is_deterministic(2);
+}
+
+#[test]
+fn staged_4bit_top_k_is_deterministic() {
+    staged_top_k_is_deterministic(4);
+}
+
